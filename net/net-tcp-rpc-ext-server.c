@@ -42,6 +42,7 @@
 #include "common/resolver.h"
 #include "common/rpc-const.h"
 #include "common/sha256.h"
+#include "mtproto/secret_store.h"
 #include "net/net-connections.h"
 #include "net/net-crypto-aes.h"
 #include "net/net-events.h"
@@ -147,12 +148,20 @@ int tcp_proxy_pass_write_packet (connection_job_t C, struct raw_message *raw) {
 
 int tcp_rpcs_default_execute (connection_job_t c, int op, struct raw_message *msg);
 
-static unsigned char ext_secret[16][16];
-static int ext_secret_cnt = 0;
+int tcp_rpcs_set_ext_secret (unsigned char secret[16]) {
+  return secret_store_add (secret, (secret_limits_t) { .max_active_connections = 0, .max_new_conn_per_min = 0 }, 0, 0);
+}
 
-void tcp_rpcs_set_ext_secret (unsigned char secret[16]) {
-  assert (ext_secret_cnt < 16);
-  memcpy (ext_secret[ext_secret_cnt ++], secret, 16);
+int tcp_rpcs_remove_ext_secret_by_id (const char *secret_id) {
+  return secret_store_remove (secret_id);
+}
+
+int tcp_rpcs_count_ext_secrets (void) {
+  return secret_store_count ();
+}
+
+int tcp_rpcs_copy_ext_secret_at (int index, unsigned char secret_out[16], char secret_id_out[65]) {
+  return secret_store_copy_secret_at (index, secret_out, secret_id_out);
 }
 
 static int allow_only_tls;
@@ -1105,7 +1114,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         assert (rwm_fetch_lookup (&c->in, &packet_len, 4) == 4);
 
         c->left_tls_packet_length -= 64; // skip header length
-      } else if ((packet_len & 0xFFFFFF) == 0x010316 && (packet_len >> 24) >= 2 && ext_secret_cnt > 0 && allow_only_tls) {
+      } else if ((packet_len & 0xFFFFFF) == 0x010316 && (packet_len >> 24) >= 2 && tcp_rpcs_count_ext_secrets () > 0 && allow_only_tls) {
         unsigned char header[5];
         assert (rwm_fetch_lookup (&c->in, header, 5) == 5);
         min_len = 5 + 256 * header[3] + header[4];
@@ -1150,9 +1159,14 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         delete_old_client_randoms();
 
         unsigned char expected_random[32];
+        int ext_secret_cnt = tcp_rpcs_count_ext_secrets ();
         int secret_id;
+        unsigned char current_secret[16];
         for (secret_id = 0; secret_id < ext_secret_cnt; secret_id++) {
-          sha256_hmac (ext_secret[secret_id], 16, client_hello, len, expected_random);
+          if (tcp_rpcs_copy_ext_secret_at (secret_id, current_secret, 0) < 0) {
+            continue;
+          }
+          sha256_hmac (current_secret, 16, client_hello, len, expected_random);
           if (memcmp (expected_random, client_random, 28) == 0) {
             break;
           }
@@ -1231,7 +1245,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         RAND_bytes (response_buffer + pos, encrypted_size);
 
         unsigned char server_random[32];
-        sha256_hmac (ext_secret[secret_id], 16, buffer, 32 + response_size, server_random);
+        sha256_hmac (current_secret, 16, buffer, 32 + response_size, server_random);
         memcpy (response_buffer + 11, server_random, 32);
 
         struct raw_message *m = calloc (sizeof (struct raw_message), 1);
@@ -1278,11 +1292,16 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
       struct aes_key_data key_data;
       
       int ok = 0;
+      int ext_secret_cnt = tcp_rpcs_count_ext_secrets ();
       int secret_id;
+      unsigned char current_secret[16];
       for (secret_id = 0; secret_id < 1 || secret_id < ext_secret_cnt; secret_id++) {
         if (ext_secret_cnt > 0) {
+          if (tcp_rpcs_copy_ext_secret_at (secret_id, current_secret, 0) < 0) {
+            continue;
+          }
           memcpy (k, random_header + 8, 32);
-          memcpy (k + 32, ext_secret[secret_id], 16);
+          memcpy (k + 32, current_secret, 16);
           sha256 (k, 48, key_data.read_key);
         } else {
           memcpy (key_data.read_key, random_header + 8, 32);
@@ -1299,6 +1318,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
 
         if (ext_secret_cnt > 0) {
           memcpy (k, key_data.write_key, 32);
+          memcpy (k + 32, current_secret, 16);
           sha256 (k, 48, key_data.write_key);
         }
 
@@ -1347,7 +1367,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         continue;
       }
 
-      if (ext_secret_cnt > 0) {
+      if (tcp_rpcs_count_ext_secrets () > 0) {
         vkprintf (1, "invalid \"random\" 64-byte header, entering global skip mode\n");
         return (-1 << 28);
       }

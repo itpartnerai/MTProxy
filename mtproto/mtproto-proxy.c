@@ -2220,7 +2220,10 @@ int f_parse_option (int val) {
         }
       }
       if (val == 'S') {
-	tcp_rpcs_set_ext_secret (secret);
+	if (tcp_rpcs_set_ext_secret (secret) < 0) {
+	  kprintf ("failed to register mtproto secret: secret store limit exceeded\n");
+	  usage ();
+	}
 	secret_count++;
       } else {
 	memcpy (proxy_tag, secret, sizeof (proxy_tag));
