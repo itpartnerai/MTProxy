@@ -31,6 +31,13 @@ if [[ ! -s "${MTPROXY_FORK_ADMIN_STATE_FILE}" ]]; then
 EOF
 fi
 
+if [[ "${EUID:-$(id -u)}" -eq 0 ]] && id "${MTPROXY_FORK_USER}" >/dev/null 2>&1; then
+  runtime_group="$(id -gn "${MTPROXY_FORK_USER}")"
+  chown "${MTPROXY_FORK_USER}:${runtime_group}" "$(dirname "${MTPROXY_FORK_ADMIN_STATE_FILE}")" "${MTPROXY_FORK_ADMIN_STATE_FILE}" "${MTPROXY_FORK_WORKDIR}"
+  chmod 0750 "$(dirname "${MTPROXY_FORK_ADMIN_STATE_FILE}")" "${MTPROXY_FORK_WORKDIR}"
+  chmod 0640 "${MTPROXY_FORK_ADMIN_STATE_FILE}"
+fi
+
 client_secret="$(read_hex_secret_file "${MTPROXY_FORK_CLIENT_SECRET_FILE}")"
 [[ "${#client_secret}" -eq 32 ]] || { echo "Client secret must contain exactly 32 hex chars" >&2; exit 1; }
 
