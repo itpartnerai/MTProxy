@@ -69,6 +69,7 @@
 int tcp_rpcs_compact_parse_execute (connection_job_t c);
 int tcp_rpcs_ext_alarm (connection_job_t c);
 int tcp_rpcs_ext_init_accepted (connection_job_t c);
+int tcp_rpcs_ext_close_connection (connection_job_t c, int who);
 
 conn_type_t ct_tcp_rpc_ext_server = {
   .magic = CONN_FUNC_MAGIC,
@@ -76,7 +77,7 @@ conn_type_t ct_tcp_rpc_ext_server = {
   .title = "rpc_ext_server",
   .init_accepted = tcp_rpcs_ext_init_accepted,
   .parse_execute = tcp_rpcs_compact_parse_execute,
-  .close = tcp_rpcs_close_connection,
+  .close = tcp_rpcs_ext_close_connection,
   .flush = tcp_rpc_flush,
   .write_packet = tcp_rpc_write_packet_compact,
   .connected = server_failed,
@@ -1005,6 +1006,63 @@ int tcp_rpcs_ext_init_accepted (connection_job_t C) {
   return tcp_rpcs_init_accepted_nohs (C);
 }
 
+static long long get_precise_now_ms (void) {
+  return (long long) (precise_now * 1000.0);
+}
+
+static int bind_secret_to_connection (connection_job_t C, const unsigned char secret[16]) {
+  struct tcp_rpc_data *D = TCP_RPC_DATA (C);
+  SecretEntry *entry = secret_store_find_by_bytes (secret);
+  if (!entry || !entry->active) {
+    vkprintf (1, "Matched secret is missing or inactive for %s:%d\n", show_remote_ip (C), CONN_INFO(C)->remote_port);
+    fail_connection (C, -1);
+    return -1;
+  }
+
+  if (D->user_data) {
+    if (D->user_data == entry) {
+      return 0;
+    }
+    vkprintf (1, "Connection %d attempted to rebind a different secret\n", CONN_INFO(C)->fd);
+    fail_connection (C, -1);
+    return -1;
+  }
+
+  long long now_ms = get_precise_now_ms ();
+  if (secret_store_check_limits (entry, now_ms) < 0) {
+    vkprintf (1, "Rejecting connection from %s:%d because secret %s exceeded limits\n",
+      show_remote_ip (C),
+      CONN_INFO(C)->remote_port,
+      entry->secret_id);
+    fail_connection (C, -1);
+    return -1;
+  }
+
+  secret_store_on_accept (entry, now_ms);
+  D->user_data = entry;
+  vkprintf (2, "Bound secret %s to connection %d from %s:%d\n",
+    entry->secret_id,
+    CONN_INFO(C)->fd,
+    show_remote_ip (C),
+    CONN_INFO(C)->remote_port);
+  return 0;
+}
+
+static void release_secret_from_connection (connection_job_t C) {
+  struct tcp_rpc_data *D = TCP_RPC_DATA (C);
+  SecretEntry *entry = D->user_data;
+  if (!entry) {
+    return;
+  }
+  secret_store_on_close (entry, get_precise_now_ms ());
+  D->user_data = 0;
+}
+
+int tcp_rpcs_ext_close_connection (connection_job_t C, int who) {
+  release_secret_from_connection (C);
+  return tcp_rpcs_close_connection (C, who);
+}
+
 int tcp_rpcs_compact_parse_execute (connection_job_t C) {
 #define RETURN_TLS_ERROR(info) \
   return proxy_connection (C, info);  
@@ -1248,6 +1306,11 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         sha256_hmac (current_secret, 16, buffer, 32 + response_size, server_random);
         memcpy (response_buffer + 11, server_random, 32);
 
+        if (bind_secret_to_connection (C, current_secret) < 0) {
+          free (buffer);
+          return 0;
+        }
+
         struct raw_message *m = calloc (sizeof (struct raw_message), 1);
         rwm_create (m, response_buffer, response_size);
         mpq_push_w (c->out_queue, m, 0);
@@ -1364,6 +1427,9 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
       }
 
       if (ok) {
+        if (ext_secret_cnt > 0 && bind_secret_to_connection (C, current_secret) < 0) {
+          return 0;
+        }
         continue;
       }
 

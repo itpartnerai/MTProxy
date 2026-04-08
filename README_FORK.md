@@ -43,6 +43,9 @@ Current implemented fork layers:
 - persistent local state file for admin-managed secrets
 - dedicated loopback-only admin API listener
 - Bearer token authentication via `MTPROXY_ADMIN_TOKEN`
+- binding of matched runtime secret to connection lifecycle
+- per-secret `active_conns` accounting on accept/close
+- per-secret limit checks at accept time for single-worker runtime
 - JSON endpoints:
   - `GET /admin/health`
   - `GET /admin/secrets`
@@ -78,6 +81,8 @@ Security model:
 - current MVP uses `POST` plus `X-HTTP-Method-Override`
 - `POST /admin/reconcile` applies full desired-state semantics and supports `dry_run`
 - admin runtime currently requires `--slaves 0` or `--slaves 1`
+- per-secret runtime enforcement is wired for matched secrets only after successful handshake selection
+- current smoke test validates admin/runtime startup paths but does not yet run a real MTProto client flow that proves rejection on limit breach
 - exact global `max_active_connections` across multiple workers is not implemented yet
 
 ## Smoke test
