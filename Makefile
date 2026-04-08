@@ -27,7 +27,7 @@ DEPDIRS := ${DEP} $(addprefix ${DEP}/,${PROJECTS})
 ALLDIRS := ${DEPDIRS} ${OBJDIRS}
 
 
-.PHONY:	all clean 
+.PHONY:	all clean test
 
 EXELIST	:= ${EXE}/mtproto-proxy
 
@@ -98,5 +98,8 @@ ${LIB}/libkdb.a: ${LIB_OBJS}
 
 clean:
 	rm -rf ${OBJ} ${DEP} ${EXE} || true
+
+test: all
+	bash tests/smoke.sh
 
 force-clean: clean

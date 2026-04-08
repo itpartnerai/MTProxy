@@ -35,8 +35,60 @@ No client-side handshake changes are allowed.
 
 In progress.
 
-The first foundation layer in this fork introduces:
+Current implemented fork layers:
 
 - `secret_store`
 - scalable runtime secret registry
 - removal of the upstream fixed `16` secret storage assumption
+- persistent local state file for admin-managed secrets
+- dedicated loopback-only admin API listener
+- Bearer token authentication via `MTPROXY_ADMIN_TOKEN`
+- JSON endpoints:
+  - `GET /admin/health`
+  - `GET /admin/secrets`
+  - `GET /admin/stats/secrets`
+  - `POST /admin/secrets`
+  - `POST /admin/secrets/{id}` with `X-HTTP-Method-Override: PATCH`
+  - `POST /admin/secrets/{id}` with `X-HTTP-Method-Override: DELETE`
+
+## Current admin API configuration
+
+Environment variables:
+
+- `MTPROXY_ADMIN_TOKEN`
+- `MTPROXY_ADMIN_PORT` (default `7081` when token is set)
+- `MTPROXY_ADMIN_STATE_FILE` (default `state/admin-secrets.json`)
+
+CLI flags:
+
+- `--admin-port <port>`
+- `--admin-state-file <path>`
+
+Security model:
+
+- admin API listens only on `127.0.0.1`
+- if `MTPROXY_ADMIN_TOKEN` is not set, admin API stays disabled
+- list/get endpoints never return raw secrets
+- raw secret is returned only once in create response when server generates it
+
+## Current limitations
+
+- true HTTP `PATCH` / `DELETE` methods are not wired yet through the upstream parser
+- current MVP uses `POST` plus `X-HTTP-Method-Override`
+- `POST /admin/reconcile` is not implemented yet
+- admin runtime currently requires `--slaves 0` or `--slaves 1`
+- exact global `max_active_connections` across multiple workers is not implemented yet
+
+## Smoke test
+
+Available command:
+
+- `make test`
+
+The smoke test builds the fork, starts a temporary MTProxy instance on high ports, and validates:
+
+- `GET /admin/health`
+- `POST /admin/secrets`
+- `GET /admin/secrets`
+- update/delete via method override
+- state file persistence
