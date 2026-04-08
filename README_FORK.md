@@ -102,3 +102,4 @@ The smoke test builds the fork, starts a temporary MTProxy instance on high port
 - real obfuscated client connect for a generated secret
 - `max_active_connections` reject on the second concurrent connection for the same secret
 - `active_conns` returns to `0` after the first client closes
+- `max_new_conn_per_min` reject on the second immediate reconnect for the same secret

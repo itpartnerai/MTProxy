@@ -31,9 +31,12 @@ RUNTIME_CREATE_JSON="${WORK_DIR}/runtime-create.json"
 RUNTIME_STATS_ACCEPT_JSON="${WORK_DIR}/runtime-stats-accept.json"
 RUNTIME_STATS_REJECT_JSON="${WORK_DIR}/runtime-stats-reject.json"
 RUNTIME_STATS_FINAL_JSON="${WORK_DIR}/runtime-stats-final.json"
+RATE_CREATE_JSON="${WORK_DIR}/rate-create.json"
+RATE_STATS_ACCEPT_JSON="${WORK_DIR}/rate-stats-accept.json"
+RATE_STATS_REJECT_JSON="${WORK_DIR}/rate-stats-reject.json"
 
 mkdir -p "${WORK_DIR}"
-rm -f "${HEALTH_JSON}" "${CREATE_JSON}" "${LIST_JSON}" "${PATCH_JSON}" "${DELETE_JSON}" "${RECONCILE_DRY_JSON}" "${RECONCILE_APPLY_JSON}" "${RECONCILE_REMOVE_JSON}" "${FINAL_LIST_JSON}" "${DELETE_CREATE_JSON}" "${RUNTIME_CREATE_JSON}" "${RUNTIME_STATS_ACCEPT_JSON}" "${RUNTIME_STATS_REJECT_JSON}" "${RUNTIME_STATS_FINAL_JSON}" "${LOG_FILE}"
+rm -f "${HEALTH_JSON}" "${CREATE_JSON}" "${LIST_JSON}" "${PATCH_JSON}" "${DELETE_JSON}" "${RECONCILE_DRY_JSON}" "${RECONCILE_APPLY_JSON}" "${RECONCILE_REMOVE_JSON}" "${FINAL_LIST_JSON}" "${DELETE_CREATE_JSON}" "${RUNTIME_CREATE_JSON}" "${RUNTIME_STATS_ACCEPT_JSON}" "${RUNTIME_STATS_REJECT_JSON}" "${RUNTIME_STATS_FINAL_JSON}" "${RATE_CREATE_JSON}" "${RATE_STATS_ACCEPT_JSON}" "${RATE_STATS_REJECT_JSON}" "${LOG_FILE}"
 rm -f "${STATE_FILE}"
 mkdir -p "$(dirname "${STATE_FILE}")"
 
@@ -227,10 +230,50 @@ PY
   sleep 0.2
 done
 
-python3 - <<'PY' "${HEALTH_JSON}" "${CREATE_JSON}" "${LIST_JSON}" "${PATCH_JSON}" "${DELETE_JSON}" "${RECONCILE_DRY_JSON}" "${RECONCILE_APPLY_JSON}" "${RECONCILE_REMOVE_JSON}" "${FINAL_LIST_JSON}" "${DELETE_CREATE_JSON}" "${STATE_FILE}" "${RUNTIME_STATS_ACCEPT_JSON}" "${RUNTIME_STATS_REJECT_JSON}" "${RUNTIME_STATS_FINAL_JSON}" "${RUNTIME_SECRET_ID}"
+curl -fsS -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{"label":"rate-limit-secret","max_active_connections":0,"max_new_conn_per_min":1}' \
+  "http://127.0.0.1:${ADMIN_PORT}/admin/secrets" > "${RATE_CREATE_JSON}"
+
+RATE_SECRET_ID="$(python3 - <<'PY' "${RATE_CREATE_JSON}"
 import json, sys
-health, create, listing, patch, delete, reconcile_dry, reconcile_apply, reconcile_remove, final_list, delete_create, state, runtime_accept, runtime_reject, runtime_final = [json.load(open(path, "r", encoding="utf-8")) for path in sys.argv[1:15]]
-runtime_secret_id = sys.argv[15]
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    data = json.load(f)
+print(data["created"]["secret_id"])
+PY
+)"
+
+RATE_SECRET_HEX="$(python3 - <<'PY' "${RATE_CREATE_JSON}"
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    data = json.load(f)
+print(data["created"]["secret"])
+PY
+)"
+
+python3 "${ROOT_DIR}/tests/obfuscated_client.py" \
+  --host 127.0.0.1 \
+  --port "${PUBLIC_PORT}" \
+  --secret "${RATE_SECRET_HEX}" \
+  --expect open
+
+curl -fsS -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+  "http://127.0.0.1:${ADMIN_PORT}/admin/stats/secrets" > "${RATE_STATS_ACCEPT_JSON}"
+
+python3 "${ROOT_DIR}/tests/obfuscated_client.py" \
+  --host 127.0.0.1 \
+  --port "${PUBLIC_PORT}" \
+  --secret "${RATE_SECRET_HEX}" \
+  --expect closed
+
+curl -fsS -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+  "http://127.0.0.1:${ADMIN_PORT}/admin/stats/secrets" > "${RATE_STATS_REJECT_JSON}"
+
+python3 - <<'PY' "${HEALTH_JSON}" "${CREATE_JSON}" "${LIST_JSON}" "${PATCH_JSON}" "${DELETE_JSON}" "${RECONCILE_DRY_JSON}" "${RECONCILE_APPLY_JSON}" "${RECONCILE_REMOVE_JSON}" "${FINAL_LIST_JSON}" "${DELETE_CREATE_JSON}" "${STATE_FILE}" "${RUNTIME_STATS_ACCEPT_JSON}" "${RUNTIME_STATS_REJECT_JSON}" "${RUNTIME_STATS_FINAL_JSON}" "${RATE_STATS_ACCEPT_JSON}" "${RATE_STATS_REJECT_JSON}" "${RUNTIME_SECRET_ID}" "${RATE_SECRET_ID}"
+import json, sys
+health, create, listing, patch, delete, reconcile_dry, reconcile_apply, reconcile_remove, final_list, delete_create, state, runtime_accept, runtime_reject, runtime_final, rate_accept, rate_reject = [json.load(open(path, "r", encoding="utf-8")) for path in sys.argv[1:17]]
+runtime_secret_id = sys.argv[17]
+rate_secret_id = sys.argv[18]
 
 assert health["ok"] is True
 assert create["ok"] is True
@@ -252,6 +295,11 @@ assert runtime_accept_entry["active_conns"] >= 1
 assert runtime_accept_entry["total_accepted"] >= 1
 assert runtime_reject_entry["total_rejected_limit"] >= 1
 assert runtime_final_entry["active_conns"] == 0
+
+rate_accept_entry = next(item for item in rate_accept["secrets"] if item["secret_id"] == rate_secret_id)
+rate_reject_entry = next(item for item in rate_reject["secrets"] if item["secret_id"] == rate_secret_id)
+assert rate_accept_entry["total_accepted"] >= 1
+assert rate_reject_entry["total_rejected_rate_limit"] >= 1
 print("smoke-ok")
 PY
 
