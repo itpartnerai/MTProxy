@@ -1,0 +1,26 @@
+[Unit]
+Description=MTProxy Fork (admin-managed secrets)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/mtproxy-fork/mtproxy-fork.env
+ExecStartPre=/usr/local/libexec/mtproxy-fork/mtproxy-fork-preflight.sh
+ExecStart=/usr/local/libexec/mtproxy-fork/mtproxy-fork-run.sh
+ExecStartPost=/usr/local/libexec/mtproxy-fork/mtproxy-fork-healthcheck.sh
+Restart=on-failure
+RestartSec=3
+WorkingDirectory=/var/lib/mtproxy-fork
+StateDirectory=mtproxy-fork
+RuntimeDirectory=mtproxy-fork
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/mtproxy-fork
+ReadOnlyPaths=/etc/mtproxy-fork /usr/local/libexec/mtproxy-fork
+LimitNOFILE=131072
+
+[Install]
+WantedBy=multi-user.target

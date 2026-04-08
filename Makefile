@@ -27,7 +27,7 @@ DEPDIRS := ${DEP} $(addprefix ${DEP}/,${PROJECTS})
 ALLDIRS := ${DEPDIRS} ${OBJDIRS}
 
 
-.PHONY:	all clean test
+.PHONY:	all clean test package
 
 EXELIST	:= ${EXE}/mtproto-proxy
 
@@ -102,5 +102,10 @@ clean:
 test: all
 	bash tests/smoke.sh
 	WORKERS=2 bash tests/smoke.sh
+
+package: all
+	rm -rf dist/package-root dist/mtproxy-fork-package.tar.gz
+	DESTDIR="$$(pwd)/dist/package-root" bash scripts/mtproxy-fork-install.sh
+	tar -C dist/package-root -czf dist/mtproxy-fork-package.tar.gz .
 
 force-clean: clean

@@ -31,6 +31,26 @@ Binary:
 make test
 ```
 
+## Package
+
+```bash
+make package
+```
+
+Generated artifact:
+
+- `dist/mtproxy-fork-package.tar.gz`
+
+Run packaging on a supported Linux build host. Upstream MTProxy compiler flags are not portable to macOS development machines.
+
+Package contents:
+
+- forked `mtproto-proxy` binary
+- systemd unit
+- env template
+- preflight/run/healthcheck scripts
+- fork docs and base commit marker
+
 What it validates:
 
 - admin API health
@@ -81,6 +101,36 @@ objs/bin/mtproto-proxy \
   --aes-pwd /opt/mtproxy-node/config/proxy-secret /opt/mtproxy-node/config/proxy-multi.conf \
   -M 2 \
   --http-stats
+```
+
+## Install package layout
+
+To stage files into a target root:
+
+```bash
+DESTDIR=/tmp/mtproxy-fork-root bash scripts/mtproxy-fork-install.sh
+```
+
+Default install destinations:
+
+- binary and wrapper scripts: `/usr/local/libexec/mtproxy-fork`
+- env template: `/etc/mtproxy-fork/mtproxy-fork.env.example`
+- systemd unit: `/etc/systemd/system/mtproxy-fork.service`
+- docs: `/usr/local/share/doc/mtproxy-fork`
+
+Recommended host preparation:
+
+- copy `mtproxy-fork.env.example` to `mtproxy-fork.env`
+- place `proxy-secret`, `proxy-multi.conf`, and `user-secret` in `/etc/mtproxy-fork`
+- review ports and worker count in the env file
+- run preflight manually before enabling the unit
+
+Example:
+
+```bash
+systemctl daemon-reload
+systemctl start mtproxy-fork.service
+systemctl status mtproxy-fork.service
 ```
 
 ## Admin API

@@ -47,6 +47,7 @@ Current implemented fork layers:
 - binding of matched runtime secret to connection lifecycle
 - per-secret `active_conns` accounting on accept/close
 - atomic per-secret limit reservation at accept time across workers
+- packaged deploy assets: systemd unit, env template, preflight, wrapper, healthcheck, install script
 - JSON endpoints:
   - `GET /admin/health`
   - `GET /admin/secrets`
@@ -91,6 +92,9 @@ Security model:
 Available command:
 
 - `make test`
+- `make package`
+
+Packaging should be executed on a supported Linux build host, the same way upstream MTProxy itself is built.
 
 The smoke test builds the fork, starts a temporary MTProxy instance on high ports, and validates:
 
@@ -115,3 +119,12 @@ Before using this fork in production, add a thin management wrapper outside the 
 - exposes authenticated operations to trusted internal systems only
 - starts MTProxy with an explicitly chosen worker count and health checks that match that topology
 - performs health checks and rollback around binary upgrades
+
+This repository now includes the first packaged deploy layer for that wrapper:
+
+- `deploy/systemd/mtproxy-fork.service`
+- `deploy/config/mtproxy-fork.env.example`
+- `scripts/mtproxy-fork-install.sh`
+- `scripts/mtproxy-fork-preflight.sh`
+- `scripts/mtproxy-fork-run.sh`
+- `scripts/mtproxy-fork-healthcheck.sh`
