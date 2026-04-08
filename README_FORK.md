@@ -99,3 +99,6 @@ The smoke test builds the fork, starts a temporary MTProxy instance on high port
 - `POST /admin/reconcile` (dry-run and apply)
 - update/delete via method override
 - state file persistence
+- real obfuscated client connect for a generated secret
+- `max_active_connections` reject on the second concurrent connection for the same secret
+- `active_conns` returns to `0` after the first client closes

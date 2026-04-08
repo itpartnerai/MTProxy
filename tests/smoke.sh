@@ -27,9 +27,13 @@ RECONCILE_APPLY_JSON="${WORK_DIR}/reconcile-apply.json"
 RECONCILE_REMOVE_JSON="${WORK_DIR}/reconcile-remove.json"
 FINAL_LIST_JSON="${WORK_DIR}/final-list.json"
 DELETE_CREATE_JSON="${WORK_DIR}/delete-create.json"
+RUNTIME_CREATE_JSON="${WORK_DIR}/runtime-create.json"
+RUNTIME_STATS_ACCEPT_JSON="${WORK_DIR}/runtime-stats-accept.json"
+RUNTIME_STATS_REJECT_JSON="${WORK_DIR}/runtime-stats-reject.json"
+RUNTIME_STATS_FINAL_JSON="${WORK_DIR}/runtime-stats-final.json"
 
 mkdir -p "${WORK_DIR}"
-rm -f "${HEALTH_JSON}" "${CREATE_JSON}" "${LIST_JSON}" "${PATCH_JSON}" "${DELETE_JSON}" "${RECONCILE_DRY_JSON}" "${RECONCILE_APPLY_JSON}" "${RECONCILE_REMOVE_JSON}" "${FINAL_LIST_JSON}" "${DELETE_CREATE_JSON}" "${LOG_FILE}"
+rm -f "${HEALTH_JSON}" "${CREATE_JSON}" "${LIST_JSON}" "${PATCH_JSON}" "${DELETE_JSON}" "${RECONCILE_DRY_JSON}" "${RECONCILE_APPLY_JSON}" "${RECONCILE_REMOVE_JSON}" "${FINAL_LIST_JSON}" "${DELETE_CREATE_JSON}" "${RUNTIME_CREATE_JSON}" "${RUNTIME_STATS_ACCEPT_JSON}" "${RUNTIME_STATS_REJECT_JSON}" "${RUNTIME_STATS_FINAL_JSON}" "${LOG_FILE}"
 rm -f "${STATE_FILE}"
 mkdir -p "$(dirname "${STATE_FILE}")"
 
@@ -44,6 +48,10 @@ if [[ ! -f "${PROXY_SECRET_FILE}" || ! -f "${PROXY_CONFIG_FILE}" || ! -f "${LEGA
 fi
 
 cleanup() {
+  if [[ -n "${runtime_client_pid:-}" ]]; then
+    kill "${runtime_client_pid}" 2>/dev/null || true
+    wait "${runtime_client_pid}" 2>/dev/null || true
+  fi
   if [[ -n "${proxy_pid:-}" ]]; then
     kill "${proxy_pid}" 2>/dev/null || true
     wait "${proxy_pid}" 2>/dev/null || true
@@ -142,9 +150,87 @@ curl -fsS -H "Authorization: Bearer ${ADMIN_TOKEN}" \
   -d '{}' \
   "http://127.0.0.1:${ADMIN_PORT}/admin/secrets/${DELETE_SECRET_ID}" > "${DELETE_JSON}"
 
-python3 - <<'PY' "${HEALTH_JSON}" "${CREATE_JSON}" "${LIST_JSON}" "${PATCH_JSON}" "${DELETE_JSON}" "${RECONCILE_DRY_JSON}" "${RECONCILE_APPLY_JSON}" "${RECONCILE_REMOVE_JSON}" "${FINAL_LIST_JSON}" "${DELETE_CREATE_JSON}" "${STATE_FILE}"
+curl -fsS -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{"label":"runtime-limit-secret","max_active_connections":1,"max_new_conn_per_min":10}' \
+  "http://127.0.0.1:${ADMIN_PORT}/admin/secrets" > "${RUNTIME_CREATE_JSON}"
+
+RUNTIME_SECRET_ID="$(python3 - <<'PY' "${RUNTIME_CREATE_JSON}"
 import json, sys
-health, create, listing, patch, delete, reconcile_dry, reconcile_apply, reconcile_remove, final_list, delete_create, state = [json.load(open(path, "r", encoding="utf-8")) for path in sys.argv[1:12]]
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    data = json.load(f)
+print(data["created"]["secret_id"])
+PY
+)"
+
+RUNTIME_SECRET_HEX="$(python3 - <<'PY' "${RUNTIME_CREATE_JSON}"
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    data = json.load(f)
+print(data["created"]["secret"])
+PY
+)"
+
+python3 "${ROOT_DIR}/tests/obfuscated_client.py" \
+  --host 127.0.0.1 \
+  --port "${PUBLIC_PORT}" \
+  --secret "${RUNTIME_SECRET_HEX}" \
+  --expect open \
+  --hold-seconds 2.5 &
+runtime_client_pid=$!
+
+for _ in {1..20}; do
+  curl -fsS -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+    "http://127.0.0.1:${ADMIN_PORT}/admin/stats/secrets" > "${RUNTIME_STATS_ACCEPT_JSON}"
+  if python3 - <<'PY' "${RUNTIME_STATS_ACCEPT_JSON}" "${RUNTIME_SECRET_ID}"
+import json, sys
+payload = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+secret_id = sys.argv[2]
+for item in payload["secrets"]:
+    if item["secret_id"] == secret_id and item["active_conns"] >= 1 and item["total_accepted"] >= 1:
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+  then
+    break
+  fi
+  sleep 0.2
+done
+
+python3 "${ROOT_DIR}/tests/obfuscated_client.py" \
+  --host 127.0.0.1 \
+  --port "${PUBLIC_PORT}" \
+  --secret "${RUNTIME_SECRET_HEX}" \
+  --expect closed
+
+wait "${runtime_client_pid}"
+unset runtime_client_pid
+
+curl -fsS -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+  "http://127.0.0.1:${ADMIN_PORT}/admin/stats/secrets" > "${RUNTIME_STATS_REJECT_JSON}"
+
+for _ in {1..20}; do
+  curl -fsS -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+    "http://127.0.0.1:${ADMIN_PORT}/admin/stats/secrets" > "${RUNTIME_STATS_FINAL_JSON}"
+  if python3 - <<'PY' "${RUNTIME_STATS_FINAL_JSON}" "${RUNTIME_SECRET_ID}"
+import json, sys
+payload = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+secret_id = sys.argv[2]
+for item in payload["secrets"]:
+    if item["secret_id"] == secret_id and item["active_conns"] == 0:
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+  then
+    break
+  fi
+  sleep 0.2
+done
+
+python3 - <<'PY' "${HEALTH_JSON}" "${CREATE_JSON}" "${LIST_JSON}" "${PATCH_JSON}" "${DELETE_JSON}" "${RECONCILE_DRY_JSON}" "${RECONCILE_APPLY_JSON}" "${RECONCILE_REMOVE_JSON}" "${FINAL_LIST_JSON}" "${DELETE_CREATE_JSON}" "${STATE_FILE}" "${RUNTIME_STATS_ACCEPT_JSON}" "${RUNTIME_STATS_REJECT_JSON}" "${RUNTIME_STATS_FINAL_JSON}" "${RUNTIME_SECRET_ID}"
+import json, sys
+health, create, listing, patch, delete, reconcile_dry, reconcile_apply, reconcile_remove, final_list, delete_create, state, runtime_accept, runtime_reject, runtime_final = [json.load(open(path, "r", encoding="utf-8")) for path in sys.argv[1:15]]
+runtime_secret_id = sys.argv[15]
 
 assert health["ok"] is True
 assert create["ok"] is True
@@ -158,6 +244,14 @@ assert reconcile_apply["ok"] is True and reconcile_apply["dry_run"] is False
 assert reconcile_remove["ok"] is True and reconcile_remove["summary"]["to_remove"] >= 1
 assert final_list["count"] == 1
 assert state["version"] == 1
+
+runtime_accept_entry = next(item for item in runtime_accept["secrets"] if item["secret_id"] == runtime_secret_id)
+runtime_reject_entry = next(item for item in runtime_reject["secrets"] if item["secret_id"] == runtime_secret_id)
+runtime_final_entry = next(item for item in runtime_final["secrets"] if item["secret_id"] == runtime_secret_id)
+assert runtime_accept_entry["active_conns"] >= 1
+assert runtime_accept_entry["total_accepted"] >= 1
+assert runtime_reject_entry["total_rejected_limit"] >= 1
+assert runtime_final_entry["active_conns"] == 0
 print("smoke-ok")
 PY
 
