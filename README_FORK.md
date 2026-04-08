@@ -33,7 +33,7 @@ No client-side handshake changes are allowed.
 
 ## Current implementation status
 
-In progress.
+Implemented and validated for single-worker MVP.
 
 Current implemented fork layers:
 
@@ -82,8 +82,10 @@ Security model:
 - `POST /admin/reconcile` applies full desired-state semantics and supports `dry_run`
 - admin runtime currently requires `--slaves 0` or `--slaves 1`
 - per-secret runtime enforcement is wired for matched secrets only after successful handshake selection
-- current smoke test validates admin/runtime startup paths but does not yet run a real MTProto client flow that proves rejection on limit breach
 - exact global `max_active_connections` across multiple workers is not implemented yet
+- exact global `max_new_conn_per_min` across multiple workers is not implemented yet
+- there is no production-ready service wrapper in this fork yet; current validation uses isolated test runs
+- the admin API is intentionally local-only and is expected to sit behind loopback access controls or an external management plane
 
 ## Smoke test
 
@@ -103,3 +105,13 @@ The smoke test builds the fork, starts a temporary MTProxy instance on high port
 - `max_active_connections` reject on the second concurrent connection for the same secret
 - `active_conns` returns to `0` after the first client closes
 - `max_new_conn_per_min` reject on the second immediate reconnect for the same secret
+
+## Recommended next integration step
+
+Before using this fork in production, add a thin management wrapper outside the proxy process that:
+
+- owns the desired-state secret inventory
+- writes the admin state file path explicitly
+- exposes authenticated operations to trusted internal systems only
+- runs MTProxy in single-worker mode for exact MVP limit enforcement
+- performs health checks and rollback around binary upgrades
