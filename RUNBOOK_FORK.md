@@ -49,6 +49,7 @@ Package contents:
 - systemd unit
 - env template
 - preflight/run/healthcheck scripts
+- test-host deploy/validate/rollback scripts
 - fork docs and base commit marker
 
 What it validates:
@@ -133,6 +134,38 @@ systemctl start mtproxy-fork.service
 systemctl status mtproxy-fork.service
 ```
 
+## Test-host rollout path
+
+Use a separate Linux host before any production rollout:
+
+```bash
+TEST_HOST=192.0.2.10 \
+TEST_HOST_SSH_USER=root \
+TEST_HOST_ACTIVATE=1 \
+bash scripts/mtproxy-fork-test-host-deploy.sh
+```
+
+Then validate:
+
+```bash
+TEST_HOST=192.0.2.10 \
+TEST_HOST_SSH_USER=root \
+bash scripts/mtproxy-fork-test-host-validate.sh
+```
+
+If rollback is needed:
+
+```bash
+TEST_HOST=192.0.2.10 \
+TEST_HOST_SSH_USER=root \
+TEST_HOST_BACKUP_DIR=/var/backups/mtproxy-fork-rollout/<timestamp> \
+bash scripts/mtproxy-fork-test-host-rollback.sh
+```
+
+Full host rollout instructions are in:
+
+- `TEST_HOST_ROLLOUT.md`
+
 ## Admin API
 
 Bind:
@@ -164,7 +197,6 @@ Security rules:
 
 - true HTTP `PATCH` / `DELETE` is not implemented
 - no unix socket listener yet
-- no packaged systemd/deploy assets in this fork yet
 - tested worker coverage currently includes `0` and `2`, not a broad stress matrix
 
 ## Recommended production pattern

@@ -48,6 +48,7 @@ Current implemented fork layers:
 - per-secret `active_conns` accounting on accept/close
 - atomic per-secret limit reservation at accept time across workers
 - packaged deploy assets: systemd unit, env template, preflight, wrapper, healthcheck, install script
+- test-host rollout assets: deploy, validate, and rollback helpers
 - JSON endpoints:
   - `GET /admin/health`
   - `GET /admin/secrets`
@@ -84,8 +85,8 @@ Security model:
 - `POST /admin/reconcile` applies full desired-state semantics and supports `dry_run`
 - per-secret runtime enforcement is wired for matched secrets only after successful handshake selection
 - current validation covers `WORKERS=0` and `WORKERS=2`; higher worker counts are not separately stress-tested yet
-- there is no production-ready service wrapper in this fork yet; current validation uses isolated test runs
 - the admin API is intentionally local-only and is expected to sit behind loopback access controls or an external management plane
+- packaged deploy assets exist, but production rollout should still start from a non-production test host
 
 ## Smoke test
 
@@ -128,3 +129,7 @@ This repository now includes the first packaged deploy layer for that wrapper:
 - `scripts/mtproxy-fork-preflight.sh`
 - `scripts/mtproxy-fork-run.sh`
 - `scripts/mtproxy-fork-healthcheck.sh`
+- `scripts/mtproxy-fork-test-host-deploy.sh`
+- `scripts/mtproxy-fork-test-host-validate.sh`
+- `scripts/mtproxy-fork-test-host-rollback.sh`
+- `TEST_HOST_ROLLOUT.md`
