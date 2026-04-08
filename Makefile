@@ -101,5 +101,6 @@ clean:
 
 test: all
 	bash tests/smoke.sh
+	WORKERS=2 bash tests/smoke.sh
 
 force-clean: clean

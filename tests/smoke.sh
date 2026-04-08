@@ -10,6 +10,7 @@ ADMIN_PORT="${ADMIN_PORT:-$((29081 + (RANDOM % 1000)))}"
 PUBLIC_PORT="${PUBLIC_PORT:-$((25443 + (RANDOM % 1000)))}"
 STATS_PORT="${STATS_PORT:-$((28888 + (RANDOM % 1000)))}"
 STATE_FILE="${STATE_FILE:-${ROOT_DIR}/state/admin-secrets.json}"
+WORKERS="${WORKERS:-0}"
 
 PROXY_SECRET_FILE="${PROXY_SECRET_FILE:-/opt/mtproxy-node/config/proxy-secret}"
 PROXY_CONFIG_FILE="${PROXY_CONFIG_FILE:-/opt/mtproxy-node/config/proxy-multi.conf}"
@@ -74,7 +75,7 @@ MTPROXY_ADMIN_STATE_FILE="${STATE_FILE}" \
   -H "${PUBLIC_PORT}" \
   -S "$(tr -d '\r\n\t ' < "${LEGACY_SECRET_FILE}")" \
   --aes-pwd "${PROXY_SECRET_FILE}" "${PROXY_CONFIG_FILE}" \
-  -M 0 \
+  -M "${WORKERS}" \
   --http-stats \
   > "${LOG_FILE}" 2>&1 &
 proxy_pid=$!

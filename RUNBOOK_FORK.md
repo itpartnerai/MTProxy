@@ -5,10 +5,11 @@
 This runbook describes how to build, test, and run the forked MTProxy binary that adds:
 
 - scalable secret storage
+- mmap-backed shared-memory secret state
 - loopback-only admin API
 - persistent secret state
 - per-secret stats
-- single-worker per-secret runtime limits
+- multi-worker per-secret runtime limits
 
 Base upstream commit:
 
@@ -55,14 +56,16 @@ New admin runtime settings:
 - `MTPROXY_ADMIN_PORT`
 - `MTPROXY_ADMIN_STATE_FILE`
 
-Recommended MVP mode:
+Validated modes:
 
-- `--slaves 0` or `--slaves 1`
+- `--slaves 0`
+- `--slaves 2`
 
 Rationale:
 
-- current per-secret counters and enforcement are validated for single-worker mode
-- exact global multi-worker enforcement is not implemented in this milestone
+- the secret store is now mmap-backed and shared across worker processes
+- accept-time reservations for `max_active_connections` and `max_new_conn_per_min` are taken under a process-shared mutex
+- higher worker counts should still be load-tested before production rollout
 
 ## Example local run
 
@@ -76,9 +79,8 @@ objs/bin/mtproto-proxy \
   -H 5443 \
   -S "$(cat /opt/mtproxy-node/config/user-secret)" \
   --aes-pwd /opt/mtproxy-node/config/proxy-secret /opt/mtproxy-node/config/proxy-multi.conf \
-  -M 0 \
-  --http-stats \
-  --slaves 0
+  -M 2 \
+  --http-stats
 ```
 
 ## Admin API
@@ -112,12 +114,12 @@ Security rules:
 
 - true HTTP `PATCH` / `DELETE` is not implemented
 - no unix socket listener yet
-- no exact global multi-worker enforcement
 - no packaged systemd/deploy assets in this fork yet
+- tested worker coverage currently includes `0` and `2`, not a broad stress matrix
 
 ## Recommended production pattern
 
 - keep Telegram client contract unchanged: `host + port + raw secret`
-- run forked proxy in single-worker mode until multi-worker accounting exists
 - place an external control plane in front of the loopback admin API
 - manage secrets through desired-state reconcile rather than imperative edits
+- stage rollout with the same worker count you intend to use in production

@@ -73,6 +73,7 @@ void secret_store_set_state_file (const char *path);
 const char *secret_store_get_state_file (void);
 int secret_store_load (void);
 int secret_store_flush (void);
+int secret_store_try_accept (SecretEntry *entry, long long now_ms);
 void secret_store_on_accept (SecretEntry *entry, long long now_ms);
 void secret_store_on_close (SecretEntry *entry, long long now_ms);
 int secret_store_check_limits (SecretEntry *entry, long long now_ms);

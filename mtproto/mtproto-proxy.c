@@ -3306,10 +3306,6 @@ void mtfront_pre_init (void) {
   }
 
   if (admin_enabled) {
-    if (workers > 1) {
-      kprintf ("admin API currently requires --slaves 0 or 1; workers=%d is not supported yet\n", workers);
-      exit (2);
-    }
     if (secret_store_load () < 0) {
       kprintf ("failed to load admin secret state from %s\n", secret_store_get_state_file ());
       exit (1);

@@ -23,28 +23,46 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include "common/sha256.h"
 
-typedef struct secret_store_state {
-  SecretEntry **entries;
-  int capacity;
+typedef struct secret_store_shared {
+  int initialized;
   int total_entries;
   pthread_mutex_t mutex;
   char state_file[PATH_MAX];
   int suppress_flush;
-} secret_store_state_t;
+  SecretEntry entries[SECRET_STORE_MAX_SECRETS];
+} secret_store_shared_t;
 
-static secret_store_state_t store = {
-  .entries = 0,
-  .capacity = 0,
-  .total_entries = 0,
-  .mutex = PTHREAD_MUTEX_INITIALIZER,
-  .state_file = {0},
-  .suppress_flush = 0
-};
+static secret_store_shared_t *store;
+static pthread_mutex_t store_init_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void secret_store_ensure_initialized (void) {
+  if (store) {
+    return;
+  }
+
+  pthread_mutex_lock (&store_init_mutex);
+  if (!store) {
+    secret_store_shared_t *mapped = mmap (0, sizeof (*mapped), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    assert (mapped != MAP_FAILED);
+    memset (mapped, 0, sizeof (*mapped));
+
+    pthread_mutexattr_t attr;
+    assert (!pthread_mutexattr_init (&attr));
+    assert (!pthread_mutexattr_setpshared (&attr, PTHREAD_PROCESS_SHARED));
+    assert (!pthread_mutex_init (&mapped->mutex, &attr));
+    assert (!pthread_mutexattr_destroy (&attr));
+
+    mapped->initialized = 1;
+    store = mapped;
+  }
+  pthread_mutex_unlock (&store_init_mutex);
+}
 
 static void bytes_to_hex (const unsigned char *input, int input_len, char *output, int output_len) {
   static const char hex_digits[] = "0123456789abcdef";
@@ -85,40 +103,11 @@ static int hex_to_bytes (const char *input, int input_len, uint8_t *output, int 
   return 0;
 }
 
-static int ensure_store_capacity_unlocked (int required) {
-  if (required <= store.capacity) {
-    return 0;
-  }
-
-  int new_capacity = store.capacity ? store.capacity : 16;
-  while (new_capacity < required) {
-    new_capacity <<= 1;
-  }
-
-  if (new_capacity > SECRET_STORE_MAX_SECRETS) {
-    new_capacity = SECRET_STORE_MAX_SECRETS;
-  }
-
-  if (required > new_capacity) {
-    return -1;
-  }
-
-  SecretEntry **new_entries = realloc (store.entries, sizeof (*new_entries) * new_capacity);
-  if (!new_entries) {
-    return -1;
-  }
-
-  memset (new_entries + store.capacity, 0, sizeof (*new_entries) * (new_capacity - store.capacity));
-  store.entries = new_entries;
-  store.capacity = new_capacity;
-  return 0;
-}
-
 static SecretEntry *find_by_bytes_unlocked (const uint8_t secret[SECRET_STORE_SECRET_LEN]) {
   int i;
-  for (i = 0; i < store.total_entries; i++) {
-    SecretEntry *entry = store.entries[i];
-    if (entry && entry->active && !memcmp (entry->secret, secret, SECRET_STORE_SECRET_LEN)) {
+  for (i = 0; i < store->total_entries; i++) {
+    SecretEntry *entry = &store->entries[i];
+    if (entry->active && !memcmp (entry->secret, secret, SECRET_STORE_SECRET_LEN)) {
       return entry;
     }
   }
@@ -128,9 +117,9 @@ static SecretEntry *find_by_bytes_unlocked (const uint8_t secret[SECRET_STORE_SE
 
 static SecretEntry *find_by_id_unlocked (const char *secret_id) {
   int i;
-  for (i = 0; i < store.total_entries; i++) {
-    SecretEntry *entry = store.entries[i];
-    if (entry && entry->active && !strcmp (entry->secret_id, secret_id)) {
+  for (i = 0; i < store->total_entries; i++) {
+    SecretEntry *entry = &store->entries[i];
+    if (entry->active && !strcmp (entry->secret_id, secret_id)) {
       return entry;
     }
   }
@@ -388,9 +377,10 @@ static int parse_secret_object (const char *p, const char **out_end, uint8_t sec
 }
 
 int secret_store_add (const uint8_t secret[SECRET_STORE_SECRET_LEN], secret_limits_t limits, const char *label, char out_id[SECRET_STORE_SECRET_ID_LEN]) {
-  pthread_mutex_lock (&store.mutex);
+  secret_store_ensure_initialized ();
+  pthread_mutex_lock (&store->mutex);
   int result = secret_store_add_unlocked (secret, limits, label, out_id, 1);
-  pthread_mutex_unlock (&store.mutex);
+  pthread_mutex_unlock (&store->mutex);
   return result;
 }
 
@@ -406,18 +396,12 @@ static int secret_store_add_unlocked (const uint8_t secret[SECRET_STORE_SECRET_L
     return 1;
   }
 
-  if (store.total_entries >= SECRET_STORE_MAX_SECRETS) {
+  if (store->total_entries >= SECRET_STORE_MAX_SECRETS) {
     return -1;
   }
 
-  if (ensure_store_capacity_unlocked (store.total_entries + 1) < 0) {
-    return -1;
-  }
-
-  SecretEntry *entry = calloc (1, sizeof (*entry));
-  if (!entry) {
-    return -1;
-  }
+  SecretEntry *entry = &store->entries[store->total_entries++];
+  memset (entry, 0, sizeof (*entry));
 
   memcpy (entry->secret, secret, SECRET_STORE_SECRET_LEN);
   memcpy (entry->secret_id, computed_id, SECRET_STORE_SECRET_ID_LEN);
@@ -435,42 +419,42 @@ static int secret_store_add_unlocked (const uint8_t secret[SECRET_STORE_SECRET_L
   entry->rate_updated_at_ms = 0;
   entry->active = 1;
 
-  store.entries[store.total_entries++] = entry;
-
   if (out_id) {
     memcpy (out_id, entry->secret_id, SECRET_STORE_SECRET_ID_LEN);
   }
 
-  if (flush_after && !store.suppress_flush && secret_store_flush_unlocked () < 0) {
+  if (flush_after && !store->suppress_flush && secret_store_flush_unlocked () < 0) {
     return -1;
   }
   return 0;
 }
 
 int secret_store_remove (const char *secret_id) {
-  pthread_mutex_lock (&store.mutex);
+  secret_store_ensure_initialized ();
+  pthread_mutex_lock (&store->mutex);
 
   SecretEntry *entry = find_by_id_unlocked (secret_id);
   if (!entry) {
-    pthread_mutex_unlock (&store.mutex);
+    pthread_mutex_unlock (&store->mutex);
     return -1;
   }
 
   entry->active = 0;
-  if (!store.suppress_flush && secret_store_flush_unlocked () < 0) {
-    pthread_mutex_unlock (&store.mutex);
+  if (!store->suppress_flush && secret_store_flush_unlocked () < 0) {
+    pthread_mutex_unlock (&store->mutex);
     return -1;
   }
-  pthread_mutex_unlock (&store.mutex);
+  pthread_mutex_unlock (&store->mutex);
   return 0;
 }
 
 int secret_store_update (const char *secret_id, const secret_limits_t *limits, const char *label) {
-  pthread_mutex_lock (&store.mutex);
+  secret_store_ensure_initialized ();
+  pthread_mutex_lock (&store->mutex);
 
   SecretEntry *entry = find_by_id_unlocked (secret_id);
   if (!entry) {
-    pthread_mutex_unlock (&store.mutex);
+    pthread_mutex_unlock (&store->mutex);
     return -1;
   }
 
@@ -487,21 +471,22 @@ int secret_store_update (const char *secret_id, const secret_limits_t *limits, c
     snprintf (entry->label, sizeof (entry->label), "%s", label);
   }
 
-  if (!store.suppress_flush && secret_store_flush_unlocked () < 0) {
-    pthread_mutex_unlock (&store.mutex);
+  if (!store->suppress_flush && secret_store_flush_unlocked () < 0) {
+    pthread_mutex_unlock (&store->mutex);
     return -1;
   }
 
-  pthread_mutex_unlock (&store.mutex);
+  pthread_mutex_unlock (&store->mutex);
   return 0;
 }
 
 SecretEntry *secret_store_find_by_bytes (const uint8_t secret[SECRET_STORE_SECRET_LEN]) {
   SecretEntry *result;
 
-  pthread_mutex_lock (&store.mutex);
+  secret_store_ensure_initialized ();
+  pthread_mutex_lock (&store->mutex);
   result = find_by_bytes_unlocked (secret);
-  pthread_mutex_unlock (&store.mutex);
+  pthread_mutex_unlock (&store->mutex);
 
   return result;
 }
@@ -509,9 +494,10 @@ SecretEntry *secret_store_find_by_bytes (const uint8_t secret[SECRET_STORE_SECRE
 SecretEntry *secret_store_find_by_id (const char *secret_id) {
   SecretEntry *result;
 
-  pthread_mutex_lock (&store.mutex);
+  secret_store_ensure_initialized ();
+  pthread_mutex_lock (&store->mutex);
   result = find_by_id_unlocked (secret_id);
-  pthread_mutex_unlock (&store.mutex);
+  pthread_mutex_unlock (&store->mutex);
 
   return result;
 }
@@ -519,14 +505,15 @@ SecretEntry *secret_store_find_by_id (const char *secret_id) {
 int secret_store_count (void) {
   int i, count = 0;
 
-  pthread_mutex_lock (&store.mutex);
-  for (i = 0; i < store.total_entries; i++) {
-    SecretEntry *entry = store.entries[i];
-    if (entry && entry->active) {
+  secret_store_ensure_initialized ();
+  pthread_mutex_lock (&store->mutex);
+  for (i = 0; i < store->total_entries; i++) {
+    SecretEntry *entry = &store->entries[i];
+    if (entry->active) {
       count++;
     }
   }
-  pthread_mutex_unlock (&store.mutex);
+  pthread_mutex_unlock (&store->mutex);
 
   return count;
 }
@@ -534,10 +521,11 @@ int secret_store_count (void) {
 int secret_store_copy_secret_at (int index, uint8_t secret_out[SECRET_STORE_SECRET_LEN], char secret_id_out[SECRET_STORE_SECRET_ID_LEN]) {
   int i, current = 0;
 
-  pthread_mutex_lock (&store.mutex);
-  for (i = 0; i < store.total_entries; i++) {
-    SecretEntry *entry = store.entries[i];
-    if (!entry || !entry->active) {
+  secret_store_ensure_initialized ();
+  pthread_mutex_lock (&store->mutex);
+  for (i = 0; i < store->total_entries; i++) {
+    SecretEntry *entry = &store->entries[i];
+    if (!entry->active) {
       continue;
     }
 
@@ -546,12 +534,12 @@ int secret_store_copy_secret_at (int index, uint8_t secret_out[SECRET_STORE_SECR
       if (secret_id_out) {
         memcpy (secret_id_out, entry->secret_id, SECRET_STORE_SECRET_ID_LEN);
       }
-      pthread_mutex_unlock (&store.mutex);
+      pthread_mutex_unlock (&store->mutex);
       return 0;
     }
     current++;
   }
-  pthread_mutex_unlock (&store.mutex);
+  pthread_mutex_unlock (&store->mutex);
 
   return -1;
 }
@@ -559,55 +547,59 @@ int secret_store_copy_secret_at (int index, uint8_t secret_out[SECRET_STORE_SECR
 int secret_store_copy_snapshot_at (int index, SecretEntrySnapshot *snapshot_out) {
   int i, current = 0;
 
-  pthread_mutex_lock (&store.mutex);
-  for (i = 0; i < store.total_entries; i++) {
-    SecretEntry *entry = store.entries[i];
-    if (!entry || !entry->active) {
+  secret_store_ensure_initialized ();
+  pthread_mutex_lock (&store->mutex);
+  for (i = 0; i < store->total_entries; i++) {
+    SecretEntry *entry = &store->entries[i];
+    if (!entry->active) {
       continue;
     }
 
     if (current == index) {
       fill_snapshot_from_entry (entry, snapshot_out);
-      pthread_mutex_unlock (&store.mutex);
+      pthread_mutex_unlock (&store->mutex);
       return 0;
     }
     current++;
   }
-  pthread_mutex_unlock (&store.mutex);
+  pthread_mutex_unlock (&store->mutex);
   return -1;
 }
 
 int secret_store_copy_snapshot_by_id (const char *secret_id, SecretEntrySnapshot *snapshot_out) {
-  pthread_mutex_lock (&store.mutex);
+  secret_store_ensure_initialized ();
+  pthread_mutex_lock (&store->mutex);
   SecretEntry *entry = find_by_id_unlocked (secret_id);
   if (!entry) {
-    pthread_mutex_unlock (&store.mutex);
+    pthread_mutex_unlock (&store->mutex);
     return -1;
   }
   fill_snapshot_from_entry (entry, snapshot_out);
-  pthread_mutex_unlock (&store.mutex);
+  pthread_mutex_unlock (&store->mutex);
   return 0;
 }
 
 void secret_store_set_state_file (const char *path) {
-  pthread_mutex_lock (&store.mutex);
-  snprintf (store.state_file, sizeof (store.state_file), "%s", path ? path : "");
-  pthread_mutex_unlock (&store.mutex);
+  secret_store_ensure_initialized ();
+  pthread_mutex_lock (&store->mutex);
+  snprintf (store->state_file, sizeof (store->state_file), "%s", path ? path : "");
+  pthread_mutex_unlock (&store->mutex);
 }
 
 const char *secret_store_get_state_file (void) {
-  return store.state_file;
+  secret_store_ensure_initialized ();
+  return store->state_file;
 }
 
 static int secret_store_flush_unlocked (void) {
-  if (!store.state_file[0]) {
+  if (!store->state_file[0]) {
     return 0;
   }
 
   char tmp_path[PATH_MAX];
-  snprintf (tmp_path, sizeof (tmp_path), "%s.tmp", store.state_file);
+  snprintf (tmp_path, sizeof (tmp_path), "%s.tmp", store->state_file);
 
-  if (ensure_parent_dir_for_file (store.state_file) < 0) {
+  if (ensure_parent_dir_for_file (store->state_file) < 0) {
     return -1;
   }
 
@@ -624,9 +616,9 @@ static int secret_store_flush_unlocked (void) {
 
   int i;
   int first = 1;
-  for (i = 0; i < store.total_entries; i++) {
-    SecretEntry *entry = store.entries[i];
-    if (!entry || !entry->active) {
+  for (i = 0; i < store->total_entries; i++) {
+    SecretEntry *entry = &store->entries[i];
+    if (!entry->active) {
       continue;
     }
 
@@ -662,7 +654,7 @@ static int secret_store_flush_unlocked (void) {
     return -1;
   }
 
-  if (rename (tmp_path, store.state_file) < 0) {
+  if (rename (tmp_path, store->state_file) < 0) {
     unlink (tmp_path);
     return -1;
   }
@@ -672,9 +664,10 @@ static int secret_store_flush_unlocked (void) {
 
 int secret_store_flush (void) {
   int result;
-  pthread_mutex_lock (&store.mutex);
+  secret_store_ensure_initialized ();
+  pthread_mutex_lock (&store->mutex);
   result = secret_store_flush_unlocked ();
-  pthread_mutex_unlock (&store.mutex);
+  pthread_mutex_unlock (&store->mutex);
   return result;
 }
 
@@ -682,39 +675,40 @@ int secret_store_load (void) {
   char *buffer = 0;
   long file_size = 0;
 
-  pthread_mutex_lock (&store.mutex);
-  if (!store.state_file[0]) {
-    pthread_mutex_unlock (&store.mutex);
+  secret_store_ensure_initialized ();
+  pthread_mutex_lock (&store->mutex);
+  if (!store->state_file[0]) {
+    pthread_mutex_unlock (&store->mutex);
     return 0;
   }
-  FILE *f = fopen (store.state_file, "r");
+  FILE *f = fopen (store->state_file, "r");
   if (!f) {
     int err = errno;
-    pthread_mutex_unlock (&store.mutex);
+    pthread_mutex_unlock (&store->mutex);
     return err == ENOENT ? 0 : -1;
   }
   if (fseek (f, 0, SEEK_END) != 0) {
     fclose (f);
-    pthread_mutex_unlock (&store.mutex);
+    pthread_mutex_unlock (&store->mutex);
     return -1;
   }
   file_size = ftell (f);
   if (file_size < 0 || fseek (f, 0, SEEK_SET) != 0) {
     fclose (f);
-    pthread_mutex_unlock (&store.mutex);
+    pthread_mutex_unlock (&store->mutex);
     return -1;
   }
 
   buffer = calloc ((size_t) file_size + 1, 1);
   if (!buffer) {
     fclose (f);
-    pthread_mutex_unlock (&store.mutex);
+    pthread_mutex_unlock (&store->mutex);
     return -1;
   }
   if (file_size > 0 && fread (buffer, 1, (size_t) file_size, f) != (size_t) file_size) {
     free (buffer);
     fclose (f);
-    pthread_mutex_unlock (&store.mutex);
+    pthread_mutex_unlock (&store->mutex);
     return -1;
   }
   fclose (f);
@@ -722,19 +716,19 @@ int secret_store_load (void) {
   const char *p = strstr (buffer, "\"secrets\"");
   if (!p) {
     free (buffer);
-    pthread_mutex_unlock (&store.mutex);
+    pthread_mutex_unlock (&store->mutex);
     return -1;
   }
 
   p = strchr (p, '[');
   if (!p) {
     free (buffer);
-    pthread_mutex_unlock (&store.mutex);
+    pthread_mutex_unlock (&store->mutex);
     return -1;
   }
   p++;
 
-  store.suppress_flush++;
+  store->suppress_flush++;
   while (1) {
     uint8_t secret[SECRET_STORE_SECRET_LEN];
     secret_limits_t limits;
@@ -749,9 +743,9 @@ int secret_store_load (void) {
     const char *next = 0;
     if (parse_secret_object (p, &next, secret, &limits, label) < 0 ||
         secret_store_add_unlocked (secret, limits, label, 0, 0) < 0) {
-      store.suppress_flush--;
+      store->suppress_flush--;
       free (buffer);
-      pthread_mutex_unlock (&store.mutex);
+      pthread_mutex_unlock (&store->mutex);
       return -1;
     }
     p = skip_ws (next);
@@ -764,14 +758,15 @@ int secret_store_load (void) {
       break;
     }
   }
-  store.suppress_flush--;
+  store->suppress_flush--;
 
   free (buffer);
-  pthread_mutex_unlock (&store.mutex);
+  pthread_mutex_unlock (&store->mutex);
   return 0;
 }
 
 int secret_store_check_limits (SecretEntry *entry, long long now_ms) {
+  secret_store_ensure_initialized ();
   if (!entry || !entry->active) {
     return -1;
   }
@@ -783,7 +778,7 @@ int secret_store_check_limits (SecretEntry *entry, long long now_ms) {
   }
 
   if (entry->limits.max_new_conn_per_min > 0) {
-    pthread_mutex_lock (&store.mutex);
+    pthread_mutex_lock (&store->mutex);
 
     if (entry->rate_updated_at_ms <= 0) {
       entry->rate_updated_at_ms = now_ms;
@@ -800,18 +795,69 @@ int secret_store_check_limits (SecretEntry *entry, long long now_ms) {
 
     if (entry->rate_tokens < 1.0) {
       atomic_fetch_add (&entry->total_rejected_rate_limit, 1);
-      pthread_mutex_unlock (&store.mutex);
+      pthread_mutex_unlock (&store->mutex);
       return -1;
     }
 
     entry->rate_tokens -= 1.0;
-    pthread_mutex_unlock (&store.mutex);
+    pthread_mutex_unlock (&store->mutex);
   }
 
   return 0;
 }
 
+int secret_store_try_accept (SecretEntry *entry, long long now_ms) {
+  secret_store_ensure_initialized ();
+  if (!entry || !entry->active) {
+    return -1;
+  }
+
+  pthread_mutex_lock (&store->mutex);
+
+  if (!entry->active) {
+    pthread_mutex_unlock (&store->mutex);
+    return -1;
+  }
+
+  if (entry->limits.max_active_connections > 0 &&
+      atomic_load (&entry->active_conns) >= entry->limits.max_active_connections) {
+    atomic_fetch_add (&entry->total_rejected_limit, 1);
+    pthread_mutex_unlock (&store->mutex);
+    return -1;
+  }
+
+  if (entry->limits.max_new_conn_per_min > 0) {
+    if (entry->rate_updated_at_ms <= 0) {
+      entry->rate_updated_at_ms = now_ms;
+      entry->rate_tokens = entry->limits.max_new_conn_per_min;
+    } else if (now_ms > entry->rate_updated_at_ms) {
+      double elapsed_ms = (double)(now_ms - entry->rate_updated_at_ms);
+      double refill = elapsed_ms * ((double) entry->limits.max_new_conn_per_min / 60000.0);
+      entry->rate_tokens += refill;
+      if (entry->rate_tokens > entry->limits.max_new_conn_per_min) {
+        entry->rate_tokens = entry->limits.max_new_conn_per_min;
+      }
+      entry->rate_updated_at_ms = now_ms;
+    }
+
+    if (entry->rate_tokens < 1.0) {
+      atomic_fetch_add (&entry->total_rejected_rate_limit, 1);
+      pthread_mutex_unlock (&store->mutex);
+      return -1;
+    }
+
+    entry->rate_tokens -= 1.0;
+  }
+
+  atomic_fetch_add (&entry->active_conns, 1);
+  atomic_fetch_add (&entry->total_accepted, 1);
+  atomic_store (&entry->last_seen, now_ms / 1000);
+  pthread_mutex_unlock (&store->mutex);
+  return 0;
+}
+
 void secret_store_on_accept (SecretEntry *entry, long long now_ms) {
+  secret_store_ensure_initialized ();
   if (!entry) {
     return;
   }
@@ -822,6 +868,7 @@ void secret_store_on_accept (SecretEntry *entry, long long now_ms) {
 }
 
 void secret_store_on_close (SecretEntry *entry, long long now_ms) {
+  secret_store_ensure_initialized ();
   if (!entry) {
     return;
   }

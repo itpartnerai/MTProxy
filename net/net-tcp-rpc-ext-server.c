@@ -1029,7 +1029,7 @@ static int bind_secret_to_connection (connection_job_t C, const unsigned char se
   }
 
   long long now_ms = get_precise_now_ms ();
-  if (secret_store_check_limits (entry, now_ms) < 0) {
+  if (secret_store_try_accept (entry, now_ms) < 0) {
     vkprintf (1, "Rejecting connection from %s:%d because secret %s exceeded limits\n",
       show_remote_ip (C),
       CONN_INFO(C)->remote_port,
@@ -1038,7 +1038,6 @@ static int bind_secret_to_connection (connection_job_t C, const unsigned char se
     return -1;
   }
 
-  secret_store_on_accept (entry, now_ms);
   D->user_data = entry;
   vkprintf (2, "Bound secret %s to connection %d from %s:%d\n",
     entry->secret_id,
