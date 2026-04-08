@@ -59,7 +59,7 @@ static void bytes_to_hex (const unsigned char *input, int input_len, char *outpu
   output[input_len * 2] = 0;
 }
 
-static void secret_store_fill_id (const uint8_t secret[SECRET_STORE_SECRET_LEN], char out_id[SECRET_STORE_SECRET_ID_LEN]) {
+void secret_store_compute_id (const uint8_t secret[SECRET_STORE_SECRET_LEN], char out_id[SECRET_STORE_SECRET_ID_LEN]) {
   unsigned char digest[32];
   sha256 (secret, SECRET_STORE_SECRET_LEN, digest);
   bytes_to_hex (digest, 32, out_id, SECRET_STORE_SECRET_ID_LEN);
@@ -396,7 +396,7 @@ int secret_store_add (const uint8_t secret[SECRET_STORE_SECRET_LEN], secret_limi
 
 static int secret_store_add_unlocked (const uint8_t secret[SECRET_STORE_SECRET_LEN], secret_limits_t limits, const char *label, char out_id[SECRET_STORE_SECRET_ID_LEN], int flush_after) {
   char computed_id[SECRET_STORE_SECRET_ID_LEN];
-  secret_store_fill_id (secret, computed_id);
+  secret_store_compute_id (secret, computed_id);
 
   SecretEntry *existing = find_by_bytes_unlocked (secret);
   if (existing) {
@@ -575,6 +575,18 @@ int secret_store_copy_snapshot_at (int index, SecretEntrySnapshot *snapshot_out)
   }
   pthread_mutex_unlock (&store.mutex);
   return -1;
+}
+
+int secret_store_copy_snapshot_by_id (const char *secret_id, SecretEntrySnapshot *snapshot_out) {
+  pthread_mutex_lock (&store.mutex);
+  SecretEntry *entry = find_by_id_unlocked (secret_id);
+  if (!entry) {
+    pthread_mutex_unlock (&store.mutex);
+    return -1;
+  }
+  fill_snapshot_from_entry (entry, snapshot_out);
+  pthread_mutex_unlock (&store.mutex);
+  return 0;
 }
 
 void secret_store_set_state_file (const char *path) {

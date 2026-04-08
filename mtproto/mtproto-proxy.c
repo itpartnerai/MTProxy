@@ -1045,6 +1045,25 @@ struct http_server_functions http_methods_stats = {
 extern int admin_enabled;
 extern char *admin_token;
 
+typedef struct admin_desired_secret_spec {
+  unsigned char secret[SECRET_STORE_SECRET_LEN];
+  int has_secret;
+  char secret_id[SECRET_STORE_SECRET_ID_LEN];
+  char label[SECRET_STORE_LABEL_LEN];
+  secret_limits_t limits;
+} admin_desired_secret_spec_t;
+
+typedef struct admin_reconcile_plan {
+  admin_desired_secret_spec_t *to_add;
+  int to_add_count;
+  admin_desired_secret_spec_t *to_update;
+  int to_update_count;
+  SecretEntrySnapshot *unchanged;
+  int unchanged_count;
+  SecretEntrySnapshot *to_remove;
+  int to_remove_count;
+} admin_reconcile_plan_t;
+
 static int append_bufferf (char **ptr, size_t *remaining, const char *pattern, ...) __attribute__ ((format (printf, 3, 4)));
 static int append_bufferf (char **ptr, size_t *remaining, const char *pattern, ...) {
   va_list ap;
@@ -1155,6 +1174,13 @@ static const char *json_find_key (const char *json, const char *key) {
   return p;
 }
 
+static const char *skip_json_ws (const char *p) {
+  while (*p && isspace ((unsigned char) *p)) {
+    p++;
+  }
+  return p;
+}
+
 static int json_extract_string_field (const char *json, const char *key, char *out, int out_len) {
   const char *p = json_find_key (json, key);
   int len = 0;
@@ -1209,6 +1235,410 @@ static int json_extract_int_field (const char *json, const char *key, int *out) 
     return -1;
   }
   *out = (int) value;
+  return 0;
+}
+
+static int json_extract_bool_field (const char *json, const char *key, int *out) {
+  const char *p = json_find_key (json, key);
+  if (!p) {
+    return -1;
+  }
+  if (!strncmp (p, "true", 4)) {
+    *out = 1;
+    return 0;
+  }
+  if (!strncmp (p, "false", 5)) {
+    *out = 0;
+    return 0;
+  }
+  return -1;
+}
+
+static const char *json_parse_string_token (const char *p, char *out, int out_len) {
+  int len = 0;
+  p = skip_json_ws (p);
+  if (*p != '"') {
+    return 0;
+  }
+  p++;
+  while (*p && *p != '"') {
+    char ch = *p++;
+    if (ch == '\\') {
+      ch = *p++;
+      switch (ch) {
+        case '"':
+        case '\\':
+        case '/':
+          break;
+        case 'n':
+          ch = '\n';
+          break;
+        case 'r':
+          ch = '\r';
+          break;
+        case 't':
+          ch = '\t';
+          break;
+        default:
+          return 0;
+      }
+    }
+    if (len + 1 >= out_len) {
+      return 0;
+    }
+    out[len++] = ch;
+  }
+  if (*p != '"') {
+    return 0;
+  }
+  out[len] = 0;
+  return p + 1;
+}
+
+static const char *json_parse_int_token (const char *p, int *out) {
+  char *end;
+  long value;
+  p = skip_json_ws (p);
+  errno = 0;
+  value = strtol (p, &end, 10);
+  if (end == p || errno) {
+    return 0;
+  }
+  *out = (int) value;
+  return end;
+}
+
+static int admin_parse_reconcile_entry (const char *p, const char **out_end, admin_desired_secret_spec_t *spec) {
+  char key[64];
+  char string_value[256];
+
+  memset (spec, 0, sizeof (*spec));
+  p = skip_json_ws (p);
+  if (*p != '{') {
+    return -1;
+  }
+  p++;
+
+  while (1) {
+    p = skip_json_ws (p);
+    if (*p == '}') {
+      p++;
+      break;
+    }
+
+    p = json_parse_string_token (p, key, sizeof (key));
+    if (!p) {
+      return -1;
+    }
+    p = skip_json_ws (p);
+    if (*p != ':') {
+      return -1;
+    }
+    p++;
+
+    if (!strcmp (key, "secret")) {
+      p = json_parse_string_token (p, string_value, sizeof (string_value));
+      if (!p || bytes_from_hex (string_value, (int) strlen (string_value), spec->secret, SECRET_STORE_SECRET_LEN) < 0) {
+        return -1;
+      }
+      spec->has_secret = 1;
+      secret_store_compute_id (spec->secret, spec->secret_id);
+    } else if (!strcmp (key, "secret_id")) {
+      p = json_parse_string_token (p, string_value, sizeof (string_value));
+      if (!p || strlen (string_value) >= sizeof (spec->secret_id)) {
+        return -1;
+      }
+      snprintf (spec->secret_id, sizeof (spec->secret_id), "%s", string_value);
+    } else if (!strcmp (key, "label")) {
+      p = json_parse_string_token (p, spec->label, sizeof (spec->label));
+      if (!p) {
+        return -1;
+      }
+    } else if (!strcmp (key, "max_active_connections")) {
+      p = json_parse_int_token (p, &spec->limits.max_active_connections);
+      if (!p) {
+        return -1;
+      }
+    } else if (!strcmp (key, "max_new_conn_per_min")) {
+      p = json_parse_int_token (p, &spec->limits.max_new_conn_per_min);
+      if (!p) {
+        return -1;
+      }
+    } else {
+      return -1;
+    }
+
+    p = skip_json_ws (p);
+    if (*p == ',') {
+      p++;
+      continue;
+    }
+    if (*p == '}') {
+      p++;
+      break;
+    }
+    return -1;
+  }
+
+  if (!spec->secret_id[0]) {
+    return -1;
+  }
+  if (spec->has_secret) {
+    char computed_id[SECRET_STORE_SECRET_ID_LEN];
+    secret_store_compute_id (spec->secret, computed_id);
+    if (strcmp (computed_id, spec->secret_id)) {
+      return -1;
+    }
+  }
+
+  *out_end = p;
+  return 0;
+}
+
+static void admin_free_reconcile_plan (admin_reconcile_plan_t *plan) {
+  free (plan->to_add);
+  free (plan->to_update);
+  free (plan->unchanged);
+  free (plan->to_remove);
+  memset (plan, 0, sizeof (*plan));
+}
+
+static int admin_append_snapshot (SecretEntrySnapshot **items, int *count, int *capacity, const SecretEntrySnapshot *snapshot) {
+  if (*count >= *capacity) {
+    int new_capacity = *capacity ? (*capacity << 1) : 16;
+    SecretEntrySnapshot *new_items = realloc (*items, (size_t) new_capacity * sizeof (**items));
+    if (!new_items) {
+      return -1;
+    }
+    *items = new_items;
+    *capacity = new_capacity;
+  }
+  (*items)[*count] = *snapshot;
+  (*count)++;
+  return 0;
+}
+
+static int admin_append_spec (admin_desired_secret_spec_t **items, int *count, int *capacity, const admin_desired_secret_spec_t *spec) {
+  if (*count >= *capacity) {
+    int new_capacity = *capacity ? (*capacity << 1) : 16;
+    admin_desired_secret_spec_t *new_items = realloc (*items, (size_t) new_capacity * sizeof (**items));
+    if (!new_items) {
+      return -1;
+    }
+    *items = new_items;
+    *capacity = new_capacity;
+  }
+  (*items)[*count] = *spec;
+  (*count)++;
+  return 0;
+}
+
+static int admin_parse_reconcile_request (const char *json, admin_desired_secret_spec_t **out_specs, int *out_count, int *out_dry_run) {
+  const char *array = json_find_key (json, "secrets");
+  int capacity = 0;
+  int count = 0;
+  admin_desired_secret_spec_t *specs = 0;
+
+  *out_specs = 0;
+  *out_count = 0;
+  *out_dry_run = 0;
+
+  if (json_extract_bool_field (json, "dry_run", out_dry_run) < 0) {
+    *out_dry_run = 0;
+  }
+
+  if (!array) {
+    return -1;
+  }
+  array = skip_json_ws (array);
+  if (*array != '[') {
+    return -1;
+  }
+  array++;
+
+  while (1) {
+    admin_desired_secret_spec_t spec;
+    int i;
+
+    array = skip_json_ws (array);
+    if (*array == ']') {
+      array++;
+      break;
+    }
+
+    const char *next = 0;
+    if (admin_parse_reconcile_entry (array, &next, &spec) < 0) {
+      free (specs);
+      return -1;
+    }
+
+    for (i = 0; i < count; i++) {
+      if (!strcmp (specs[i].secret_id, spec.secret_id)) {
+        free (specs);
+        return -1;
+      }
+    }
+
+    if (admin_append_spec (&specs, &count, &capacity, &spec) < 0) {
+      free (specs);
+      return -1;
+    }
+
+    array = skip_json_ws (next);
+    if (*array == ',') {
+      array++;
+      continue;
+    }
+    if (*array == ']') {
+      array++;
+      break;
+    }
+    free (specs);
+    return -1;
+  }
+
+  *out_specs = specs;
+  *out_count = count;
+  return 0;
+}
+
+static int admin_build_reconcile_plan (const admin_desired_secret_spec_t *desired_specs, int desired_count, admin_reconcile_plan_t *plan) {
+  int current_count = secret_store_count ();
+  int i;
+  int add_capacity = 0, update_capacity = 0, unchanged_capacity = 0, remove_capacity = 0;
+
+  memset (plan, 0, sizeof (*plan));
+
+  for (i = 0; i < desired_count; i++) {
+    SecretEntrySnapshot current_snapshot;
+    int has_current = secret_store_copy_snapshot_by_id (desired_specs[i].secret_id, &current_snapshot) == 0;
+
+    if (!has_current) {
+      if (!desired_specs[i].has_secret) {
+        admin_free_reconcile_plan (plan);
+        return -1;
+      }
+      if (admin_append_spec (&plan->to_add, &plan->to_add_count, &add_capacity, &desired_specs[i]) < 0) {
+        admin_free_reconcile_plan (plan);
+        return -1;
+      }
+      continue;
+    }
+
+    if (strcmp (current_snapshot.label, desired_specs[i].label) ||
+        current_snapshot.limits.max_active_connections != desired_specs[i].limits.max_active_connections ||
+        current_snapshot.limits.max_new_conn_per_min != desired_specs[i].limits.max_new_conn_per_min) {
+      if (admin_append_spec (&plan->to_update, &plan->to_update_count, &update_capacity, &desired_specs[i]) < 0) {
+        admin_free_reconcile_plan (plan);
+        return -1;
+      }
+    } else {
+      if (admin_append_snapshot (&plan->unchanged, &plan->unchanged_count, &unchanged_capacity, &current_snapshot) < 0) {
+        admin_free_reconcile_plan (plan);
+        return -1;
+      }
+    }
+  }
+
+  for (i = 0; i < current_count; i++) {
+    SecretEntrySnapshot snapshot;
+    int desired_index;
+    if (secret_store_copy_snapshot_at (i, &snapshot) < 0) {
+      continue;
+    }
+    for (desired_index = 0; desired_index < desired_count; desired_index++) {
+      if (!strcmp (desired_specs[desired_index].secret_id, snapshot.secret_id)) {
+        break;
+      }
+    }
+    if (desired_index == desired_count) {
+      if (admin_append_snapshot (&plan->to_remove, &plan->to_remove_count, &remove_capacity, &snapshot) < 0) {
+        admin_free_reconcile_plan (plan);
+        return -1;
+      }
+    }
+  }
+
+  return 0;
+}
+
+static int admin_apply_reconcile_plan (const admin_reconcile_plan_t *plan) {
+  int i;
+
+  for (i = 0; i < plan->to_remove_count; i++) {
+    if (secret_store_remove (plan->to_remove[i].secret_id) < 0) {
+      return -1;
+    }
+  }
+
+  for (i = 0; i < plan->to_update_count; i++) {
+    if (secret_store_update (plan->to_update[i].secret_id, &plan->to_update[i].limits, plan->to_update[i].label) < 0) {
+      return -1;
+    }
+  }
+
+  for (i = 0; i < plan->to_add_count; i++) {
+    if (!plan->to_add[i].has_secret ||
+        secret_store_add (plan->to_add[i].secret, plan->to_add[i].limits, plan->to_add[i].label, 0) < 0) {
+      return -1;
+    }
+  }
+
+  return 0;
+}
+
+static int admin_write_reconcile_json (char *body, size_t body_size, int dry_run, const admin_reconcile_plan_t *plan) {
+  char *ptr = body;
+  size_t remaining = body_size;
+  int i;
+
+  if (append_bufferf (&ptr, &remaining,
+      "{\"ok\":true,\"dry_run\":%s,\"summary\":{\"to_add\":%d,\"to_update\":%d,\"to_remove\":%d,\"unchanged\":%d},"
+      "\"to_add\":[",
+      dry_run ? "true" : "false",
+      plan->to_add_count,
+      plan->to_update_count,
+      plan->to_remove_count,
+      plan->unchanged_count) < 0) {
+    return -1;
+  }
+
+  for (i = 0; i < plan->to_add_count; i++) {
+    if (append_bufferf (&ptr, &remaining, "%s{\"secret_id\":\"%s\"}", i ? "," : "", plan->to_add[i].secret_id) < 0) {
+      return -1;
+    }
+  }
+
+  if (append_bufferf (&ptr, &remaining, "],\"to_update\":[") < 0) {
+    return -1;
+  }
+  for (i = 0; i < plan->to_update_count; i++) {
+    if (append_bufferf (&ptr, &remaining, "%s{\"secret_id\":\"%s\"}", i ? "," : "", plan->to_update[i].secret_id) < 0) {
+      return -1;
+    }
+  }
+
+  if (append_bufferf (&ptr, &remaining, "],\"to_remove\":[") < 0) {
+    return -1;
+  }
+  for (i = 0; i < plan->to_remove_count; i++) {
+    if (append_bufferf (&ptr, &remaining, "%s{\"secret_id\":\"%s\"}", i ? "," : "", plan->to_remove[i].secret_id) < 0) {
+      return -1;
+    }
+  }
+
+  if (append_bufferf (&ptr, &remaining, "],\"unchanged\":[") < 0) {
+    return -1;
+  }
+  for (i = 0; i < plan->unchanged_count; i++) {
+    if (append_bufferf (&ptr, &remaining, "%s{\"secret_id\":\"%s\"}", i ? "," : "", plan->unchanged[i].secret_id) < 0) {
+      return -1;
+    }
+  }
+
+  if (append_bufferf (&ptr, &remaining, "]}") < 0) {
+    return -1;
+  }
   return 0;
 }
 
@@ -1764,7 +2194,36 @@ int hts_admin_execute (connection_job_t c, struct raw_message *msg, int op) {
   }
 
   if (!strcmp (uri, "/admin/reconcile") && op == htqt_post) {
-    write_admin_json_response (c, 501, "{\"ok\":false,\"error\":\"reconcile_not_implemented\"}");
+    admin_desired_secret_spec_t *desired_specs = 0;
+    admin_reconcile_plan_t plan;
+    int desired_count = 0;
+    int dry_run = 0;
+    char response[1 << 18];
+
+    if (admin_parse_reconcile_request (body, &desired_specs, &desired_count, &dry_run) < 0 ||
+        admin_build_reconcile_plan (desired_specs, desired_count, &plan) < 0) {
+      free (desired_specs);
+      free (request);
+      return -400;
+    }
+
+    if (!dry_run && admin_apply_reconcile_plan (&plan) < 0) {
+      admin_free_reconcile_plan (&plan);
+      free (desired_specs);
+      free (request);
+      return -500;
+    }
+
+    if (admin_write_reconcile_json (response, sizeof (response), dry_run, &plan) < 0) {
+      admin_free_reconcile_plan (&plan);
+      free (desired_specs);
+      free (request);
+      return -500;
+    }
+
+    admin_free_reconcile_plan (&plan);
+    free (desired_specs);
+    write_admin_json_response (c, 200, response);
     free (request);
     return 0;
   }

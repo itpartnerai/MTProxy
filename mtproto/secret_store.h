@@ -62,11 +62,13 @@ typedef struct secret_entry_snapshot {
 int secret_store_add (const uint8_t secret[SECRET_STORE_SECRET_LEN], secret_limits_t limits, const char *label, char out_id[SECRET_STORE_SECRET_ID_LEN]);
 int secret_store_remove (const char *secret_id);
 int secret_store_update (const char *secret_id, const secret_limits_t *limits, const char *label);
+void secret_store_compute_id (const uint8_t secret[SECRET_STORE_SECRET_LEN], char out_id[SECRET_STORE_SECRET_ID_LEN]);
 SecretEntry *secret_store_find_by_bytes (const uint8_t secret[SECRET_STORE_SECRET_LEN]);
 SecretEntry *secret_store_find_by_id (const char *secret_id);
 int secret_store_count (void);
 int secret_store_copy_secret_at (int index, uint8_t secret_out[SECRET_STORE_SECRET_LEN], char secret_id_out[SECRET_STORE_SECRET_ID_LEN]);
 int secret_store_copy_snapshot_at (int index, SecretEntrySnapshot *snapshot_out);
+int secret_store_copy_snapshot_by_id (const char *secret_id, SecretEntrySnapshot *snapshot_out);
 void secret_store_set_state_file (const char *path);
 const char *secret_store_get_state_file (void);
 int secret_store_load (void);

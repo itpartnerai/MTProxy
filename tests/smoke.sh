@@ -6,9 +6,9 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${ROOT_DIR}/objs/bin/mtproto-proxy"
 
 ADMIN_TOKEN="${ADMIN_TOKEN:-test-admin-token}"
-ADMIN_PORT="${ADMIN_PORT:-29081}"
-PUBLIC_PORT="${PUBLIC_PORT:-25443}"
-STATS_PORT="${STATS_PORT:-28888}"
+ADMIN_PORT="${ADMIN_PORT:-$((29081 + (RANDOM % 1000)))}"
+PUBLIC_PORT="${PUBLIC_PORT:-$((25443 + (RANDOM % 1000)))}"
+STATS_PORT="${STATS_PORT:-$((28888 + (RANDOM % 1000)))}"
 STATE_FILE="${STATE_FILE:-${ROOT_DIR}/state/admin-secrets.json}"
 
 PROXY_SECRET_FILE="${PROXY_SECRET_FILE:-/opt/mtproxy-node/config/proxy-secret}"
@@ -22,9 +22,15 @@ CREATE_JSON="${WORK_DIR}/create.json"
 LIST_JSON="${WORK_DIR}/list.json"
 PATCH_JSON="${WORK_DIR}/patch.json"
 DELETE_JSON="${WORK_DIR}/delete.json"
+RECONCILE_DRY_JSON="${WORK_DIR}/reconcile-dry.json"
+RECONCILE_APPLY_JSON="${WORK_DIR}/reconcile-apply.json"
+RECONCILE_REMOVE_JSON="${WORK_DIR}/reconcile-remove.json"
+FINAL_LIST_JSON="${WORK_DIR}/final-list.json"
+DELETE_CREATE_JSON="${WORK_DIR}/delete-create.json"
 
 mkdir -p "${WORK_DIR}"
-rm -f "${HEALTH_JSON}" "${CREATE_JSON}" "${LIST_JSON}" "${PATCH_JSON}" "${DELETE_JSON}" "${LOG_FILE}"
+rm -f "${HEALTH_JSON}" "${CREATE_JSON}" "${LIST_JSON}" "${PATCH_JSON}" "${DELETE_JSON}" "${RECONCILE_DRY_JSON}" "${RECONCILE_APPLY_JSON}" "${RECONCILE_REMOVE_JSON}" "${FINAL_LIST_JSON}" "${DELETE_CREATE_JSON}" "${LOG_FILE}"
+rm -f "${STATE_FILE}"
 mkdir -p "$(dirname "${STATE_FILE}")"
 
 if [[ ! -x "${BIN}" ]]; then
@@ -42,8 +48,11 @@ cleanup() {
     kill "${proxy_pid}" 2>/dev/null || true
     wait "${proxy_pid}" 2>/dev/null || true
   fi
+  pkill -f "${BIN} -u nobody -p ${STATS_PORT} -H ${PUBLIC_PORT}" 2>/dev/null || true
 }
 trap cleanup EXIT
+
+pkill -f "${BIN} -u nobody -p ${STATS_PORT} -H ${PUBLIC_PORT}" 2>/dev/null || true
 
 MTPROXY_ADMIN_TOKEN="${ADMIN_TOKEN}" \
 MTPROXY_ADMIN_PORT="${ADMIN_PORT}" \
@@ -82,6 +91,15 @@ PY
 curl -fsS -H "Authorization: Bearer ${ADMIN_TOKEN}" \
   "http://127.0.0.1:${ADMIN_PORT}/admin/secrets" > "${LIST_JSON}"
 
+LEGACY_SECRET_ID="$(python3 - <<'PY' "${LIST_JSON}" "${SECRET_ID}"
+import json, sys
+listing = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+created_id = sys.argv[2]
+legacy = [item["secret_id"] for item in listing["secrets"] if item["secret_id"] != created_id]
+print(legacy[0])
+PY
+)"
+
 curl -fsS -H "Authorization: Bearer ${ADMIN_TOKEN}" \
   -H "X-HTTP-Method-Override: PATCH" \
   -H "Content-Type: application/json" \
@@ -89,14 +107,44 @@ curl -fsS -H "Authorization: Bearer ${ADMIN_TOKEN}" \
   "http://127.0.0.1:${ADMIN_PORT}/admin/secrets/${SECRET_ID}" > "${PATCH_JSON}"
 
 curl -fsS -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d "{\"dry_run\":true,\"secrets\":[{\"secret_id\":\"${LEGACY_SECRET_ID}\",\"label\":\"legacy\",\"max_active_connections\":0,\"max_new_conn_per_min\":0},{\"secret_id\":\"${SECRET_ID}\",\"label\":\"smoke-secret-reconciled\",\"max_active_connections\":4,\"max_new_conn_per_min\":9}]}" \
+  "http://127.0.0.1:${ADMIN_PORT}/admin/reconcile" > "${RECONCILE_DRY_JSON}"
+
+curl -fsS -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d "{\"secrets\":[{\"secret_id\":\"${LEGACY_SECRET_ID}\",\"label\":\"legacy\",\"max_active_connections\":0,\"max_new_conn_per_min\":0},{\"secret_id\":\"${SECRET_ID}\",\"label\":\"smoke-secret-reconciled\",\"max_active_connections\":4,\"max_new_conn_per_min\":9}]}" \
+  "http://127.0.0.1:${ADMIN_PORT}/admin/reconcile" > "${RECONCILE_APPLY_JSON}"
+
+curl -fsS -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d "{\"secrets\":[{\"secret_id\":\"${LEGACY_SECRET_ID}\",\"label\":\"legacy\",\"max_active_connections\":0,\"max_new_conn_per_min\":0}]}" \
+  "http://127.0.0.1:${ADMIN_PORT}/admin/reconcile" > "${RECONCILE_REMOVE_JSON}"
+
+curl -fsS -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+  "http://127.0.0.1:${ADMIN_PORT}/admin/secrets" > "${FINAL_LIST_JSON}"
+
+curl -fsS -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{"label":"delete-me","max_active_connections":1,"max_new_conn_per_min":1}' \
+  "http://127.0.0.1:${ADMIN_PORT}/admin/secrets" > "${DELETE_CREATE_JSON}"
+
+DELETE_SECRET_ID="$(python3 - <<'PY' "${DELETE_CREATE_JSON}"
+import json, sys
+payload = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+print(payload["created"]["secret_id"])
+PY
+)"
+
+curl -fsS -H "Authorization: Bearer ${ADMIN_TOKEN}" \
   -H "X-HTTP-Method-Override: DELETE" \
   -H "Content-Type: application/json" \
   -d '{}' \
-  "http://127.0.0.1:${ADMIN_PORT}/admin/secrets/${SECRET_ID}" > "${DELETE_JSON}"
+  "http://127.0.0.1:${ADMIN_PORT}/admin/secrets/${DELETE_SECRET_ID}" > "${DELETE_JSON}"
 
-python3 - <<'PY' "${HEALTH_JSON}" "${CREATE_JSON}" "${LIST_JSON}" "${PATCH_JSON}" "${DELETE_JSON}" "${STATE_FILE}"
+python3 - <<'PY' "${HEALTH_JSON}" "${CREATE_JSON}" "${LIST_JSON}" "${PATCH_JSON}" "${DELETE_JSON}" "${RECONCILE_DRY_JSON}" "${RECONCILE_APPLY_JSON}" "${RECONCILE_REMOVE_JSON}" "${FINAL_LIST_JSON}" "${DELETE_CREATE_JSON}" "${STATE_FILE}"
 import json, sys
-health, create, listing, patch, delete, state = [json.load(open(path, "r", encoding="utf-8")) for path in sys.argv[1:7]]
+health, create, listing, patch, delete, reconcile_dry, reconcile_apply, reconcile_remove, final_list, delete_create, state = [json.load(open(path, "r", encoding="utf-8")) for path in sys.argv[1:12]]
 
 assert health["ok"] is True
 assert create["ok"] is True
@@ -104,6 +152,11 @@ assert "created" in create and len(create["created"]["secret"]) == 32
 assert listing["count"] >= 2
 assert patch["ok"] is True
 assert delete["ok"] is True
+assert delete_create["ok"] is True
+assert reconcile_dry["ok"] is True and reconcile_dry["dry_run"] is True
+assert reconcile_apply["ok"] is True and reconcile_apply["dry_run"] is False
+assert reconcile_remove["ok"] is True and reconcile_remove["summary"]["to_remove"] >= 1
+assert final_list["count"] == 1
 assert state["version"] == 1
 print("smoke-ok")
 PY

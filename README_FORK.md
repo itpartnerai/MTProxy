@@ -46,10 +46,11 @@ Current implemented fork layers:
 - JSON endpoints:
   - `GET /admin/health`
   - `GET /admin/secrets`
-  - `GET /admin/stats/secrets`
-  - `POST /admin/secrets`
-  - `POST /admin/secrets/{id}` with `X-HTTP-Method-Override: PATCH`
-  - `POST /admin/secrets/{id}` with `X-HTTP-Method-Override: DELETE`
+- `GET /admin/stats/secrets`
+- `POST /admin/secrets`
+- `POST /admin/secrets/{id}` with `X-HTTP-Method-Override: PATCH`
+- `POST /admin/secrets/{id}` with `X-HTTP-Method-Override: DELETE`
+- `POST /admin/reconcile`
 
 ## Current admin API configuration
 
@@ -75,7 +76,7 @@ Security model:
 
 - true HTTP `PATCH` / `DELETE` methods are not wired yet through the upstream parser
 - current MVP uses `POST` plus `X-HTTP-Method-Override`
-- `POST /admin/reconcile` is not implemented yet
+- `POST /admin/reconcile` applies full desired-state semantics and supports `dry_run`
 - admin runtime currently requires `--slaves 0` or `--slaves 1`
 - exact global `max_active_connections` across multiple workers is not implemented yet
 
@@ -90,5 +91,6 @@ The smoke test builds the fork, starts a temporary MTProxy instance on high port
 - `GET /admin/health`
 - `POST /admin/secrets`
 - `GET /admin/secrets`
+- `POST /admin/reconcile` (dry-run and apply)
 - update/delete via method override
 - state file persistence
