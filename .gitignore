@@ -1,2 +1,4 @@
 objs
 dep
+tests/__pycache__
+dist

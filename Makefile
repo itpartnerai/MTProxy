@@ -27,13 +27,13 @@ DEPDIRS := ${DEP} $(addprefix ${DEP}/,${PROJECTS})
 ALLDIRS := ${DEPDIRS} ${OBJDIRS}
 
 
-.PHONY:	all clean 
+.PHONY:	all clean test package
 
 EXELIST	:= ${EXE}/mtproto-proxy
 
 
 OBJECTS	=	\
-  ${OBJ}/mtproto/mtproto-proxy.o ${OBJ}/mtproto/mtproto-config.o ${OBJ}/net/net-tcp-rpc-ext-server.o
+  ${OBJ}/mtproto/mtproto-proxy.o ${OBJ}/mtproto/mtproto-config.o ${OBJ}/mtproto/secret_store.o ${OBJ}/net/net-tcp-rpc-ext-server.o
 
 DEPENDENCE_CXX		:=	$(subst ${OBJ}/,${DEP}/,$(patsubst %.o,%.d,${OBJECTS_CXX}))
 DEPENDENCE_STRANGE	:=	$(subst ${OBJ}/,${DEP}/,$(patsubst %.o,%.d,${OBJECTS_STRANGE}))
@@ -90,7 +90,7 @@ ${LIB_OBJS_NORMAL}: ${OBJ}/%.o: %.c | create_dirs_and_headers
 
 ${EXELIST}: ${LIBLIST}
 
-${EXE}/mtproto-proxy:	${OBJ}/mtproto/mtproto-proxy.o ${OBJ}/mtproto/mtproto-config.o ${OBJ}/net/net-tcp-rpc-ext-server.o
+${EXE}/mtproto-proxy:	${OBJ}/mtproto/mtproto-proxy.o ${OBJ}/mtproto/mtproto-config.o ${OBJ}/mtproto/secret_store.o ${OBJ}/net/net-tcp-rpc-ext-server.o
 	${CC} -o $@ $^ ${LIB}/libkdb.a ${LDFLAGS}
 
 ${LIB}/libkdb.a: ${LIB_OBJS}
@@ -99,5 +99,13 @@ ${LIB}/libkdb.a: ${LIB_OBJS}
 clean:
 	rm -rf ${OBJ} ${DEP} ${EXE} || true
 
-force-clean: clean
+test: all
+	bash tests/smoke.sh
+	WORKERS=2 bash tests/smoke.sh
 
+package: all
+	rm -rf dist/package-root dist/mtproxy-fork-package.tar.gz
+	DESTDIR="$$(pwd)/dist/package-root" bash scripts/mtproxy-fork-install.sh
+	tar -C dist/package-root -czf dist/mtproxy-fork-package.tar.gz .
+
+force-clean: clean

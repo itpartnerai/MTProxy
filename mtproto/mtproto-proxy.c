@@ -26,6 +26,7 @@
 
 #include <assert.h>
 #include <errno.h>
+#include <stdarg.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -58,6 +59,7 @@
 #include "net/net-tcp-rpc-ext-server.h"
 #include "net/net-crypto-aes.h"
 #include "net/net-crypto-dh.h"
+#include "mtproto/secret_store.h"
 #include "mtproto-common.h"
 #include "mtproto-config.h"
 #include "common/tl-parse.h"
@@ -1018,6 +1020,7 @@ int mtfront_client_close (connection_job_t C, int who) {
  */
 
 int hts_execute (connection_job_t C, struct raw_message *msg, int op);
+int hts_admin_execute (connection_job_t C, struct raw_message *msg, int op);
 int mtproto_http_alarm (connection_job_t C);
 int mtproto_http_close (connection_job_t C, int who);
 
@@ -1029,9 +1032,696 @@ struct http_server_functions http_methods = {
   .ht_close = mtproto_http_close
 };
 
+struct http_server_functions http_methods_admin = {
+  .execute = hts_admin_execute,
+  .ht_alarm = mtproto_http_alarm,
+  .ht_close = mtproto_http_close
+};
+
 struct http_server_functions http_methods_stats = {
   .execute = hts_stats_execute
 };
+
+extern int admin_enabled;
+extern char *admin_token;
+
+typedef struct admin_desired_secret_spec {
+  unsigned char secret[SECRET_STORE_SECRET_LEN];
+  int has_secret;
+  char secret_id[SECRET_STORE_SECRET_ID_LEN];
+  char label[SECRET_STORE_LABEL_LEN];
+  secret_limits_t limits;
+} admin_desired_secret_spec_t;
+
+typedef struct admin_reconcile_plan {
+  admin_desired_secret_spec_t *to_add;
+  int to_add_count;
+  admin_desired_secret_spec_t *to_update;
+  int to_update_count;
+  SecretEntrySnapshot *unchanged;
+  int unchanged_count;
+  SecretEntrySnapshot *to_remove;
+  int to_remove_count;
+} admin_reconcile_plan_t;
+
+static int append_bufferf (char **ptr, size_t *remaining, const char *pattern, ...) __attribute__ ((format (printf, 3, 4)));
+static int append_bufferf (char **ptr, size_t *remaining, const char *pattern, ...) {
+  va_list ap;
+  va_start (ap, pattern);
+  int written = vsnprintf (*ptr, *remaining, pattern, ap);
+  va_end (ap);
+  if (written < 0 || (size_t) written >= *remaining) {
+    return -1;
+  }
+  *ptr += written;
+  *remaining -= written;
+  return 0;
+}
+
+static int append_json_string (char **ptr, size_t *remaining, const char *value) {
+  const unsigned char *p = (const unsigned char *) (value ? value : "");
+  if (*remaining < 3) {
+    return -1;
+  }
+  *(*ptr)++ = '"';
+  *remaining -= 1;
+  while (*p) {
+    if (*remaining < 3) {
+      return -1;
+    }
+    switch (*p) {
+      case '\\':
+      case '"':
+        *(*ptr)++ = '\\';
+        *(*ptr)++ = (char) *p;
+        *remaining -= 2;
+        break;
+      case '\n':
+        *(*ptr)++ = '\\';
+        *(*ptr)++ = 'n';
+        *remaining -= 2;
+        break;
+      case '\r':
+        *(*ptr)++ = '\\';
+        *(*ptr)++ = 'r';
+        *remaining -= 2;
+        break;
+      case '\t':
+        *(*ptr)++ = '\\';
+        *(*ptr)++ = 't';
+        *remaining -= 2;
+        break;
+      default:
+        *(*ptr)++ = (char) *p;
+        *remaining -= 1;
+        break;
+    }
+    p++;
+  }
+  *(*ptr)++ = '"';
+  *remaining -= 1;
+  **ptr = 0;
+  return 0;
+}
+
+static int bytes_from_hex (const char *input, int input_len, unsigned char *output, int output_len) {
+  int i;
+  if (input_len != output_len * 2) {
+    return -1;
+  }
+  for (i = 0; i < output_len; i++) {
+    char hi = input[i * 2];
+    char lo = input[i * 2 + 1];
+    int hi_value = isdigit (hi) ? hi - '0' : (tolower (hi) - 'a' + 10);
+    int lo_value = isdigit (lo) ? lo - '0' : (tolower (lo) - 'a' + 10);
+    if (!isxdigit (hi) || !isxdigit (lo)) {
+      return -1;
+    }
+    output[i] = (unsigned char) ((hi_value << 4) | lo_value);
+  }
+  return 0;
+}
+
+static void bytes_to_hex_local (const unsigned char *input, int input_len, char *output, int output_len) {
+  static const char hex_digits[] = "0123456789abcdef";
+  int i;
+  assert (output_len >= input_len * 2 + 1);
+  for (i = 0; i < input_len; i++) {
+    output[i * 2] = hex_digits[input[i] >> 4];
+    output[i * 2 + 1] = hex_digits[input[i] & 15];
+  }
+  output[input_len * 2] = 0;
+}
+
+static const char *json_find_key (const char *json, const char *key) {
+  static char pattern[128];
+  snprintf (pattern, sizeof (pattern), "\"%s\"", key);
+  const char *p = strstr (json, pattern);
+  if (!p) {
+    return 0;
+  }
+  p += strlen (pattern);
+  while (*p && isspace ((unsigned char) *p)) {
+    p++;
+  }
+  if (*p != ':') {
+    return 0;
+  }
+  p++;
+  while (*p && isspace ((unsigned char) *p)) {
+    p++;
+  }
+  return p;
+}
+
+static const char *skip_json_ws (const char *p) {
+  while (*p && isspace ((unsigned char) *p)) {
+    p++;
+  }
+  return p;
+}
+
+static int json_extract_string_field (const char *json, const char *key, char *out, int out_len) {
+  const char *p = json_find_key (json, key);
+  int len = 0;
+  if (!p || *p != '"') {
+    return -1;
+  }
+  p++;
+  while (*p && *p != '"') {
+    char ch = *p++;
+    if (ch == '\\') {
+      ch = *p++;
+      switch (ch) {
+        case '"':
+        case '\\':
+        case '/':
+          break;
+        case 'n':
+          ch = '\n';
+          break;
+        case 'r':
+          ch = '\r';
+          break;
+        case 't':
+          ch = '\t';
+          break;
+        default:
+          return -1;
+      }
+    }
+    if (len + 1 >= out_len) {
+      return -1;
+    }
+    out[len++] = ch;
+  }
+  if (*p != '"') {
+    return -1;
+  }
+  out[len] = 0;
+  return 0;
+}
+
+static int json_extract_int_field (const char *json, const char *key, int *out) {
+  const char *p = json_find_key (json, key);
+  char *end;
+  long value;
+  if (!p) {
+    return -1;
+  }
+  errno = 0;
+  value = strtol (p, &end, 10);
+  if (end == p || errno) {
+    return -1;
+  }
+  *out = (int) value;
+  return 0;
+}
+
+static int json_extract_bool_field (const char *json, const char *key, int *out) {
+  const char *p = json_find_key (json, key);
+  if (!p) {
+    return -1;
+  }
+  if (!strncmp (p, "true", 4)) {
+    *out = 1;
+    return 0;
+  }
+  if (!strncmp (p, "false", 5)) {
+    *out = 0;
+    return 0;
+  }
+  return -1;
+}
+
+static const char *json_parse_string_token (const char *p, char *out, int out_len) {
+  int len = 0;
+  p = skip_json_ws (p);
+  if (*p != '"') {
+    return 0;
+  }
+  p++;
+  while (*p && *p != '"') {
+    char ch = *p++;
+    if (ch == '\\') {
+      ch = *p++;
+      switch (ch) {
+        case '"':
+        case '\\':
+        case '/':
+          break;
+        case 'n':
+          ch = '\n';
+          break;
+        case 'r':
+          ch = '\r';
+          break;
+        case 't':
+          ch = '\t';
+          break;
+        default:
+          return 0;
+      }
+    }
+    if (len + 1 >= out_len) {
+      return 0;
+    }
+    out[len++] = ch;
+  }
+  if (*p != '"') {
+    return 0;
+  }
+  out[len] = 0;
+  return p + 1;
+}
+
+static const char *json_parse_int_token (const char *p, int *out) {
+  char *end;
+  long value;
+  p = skip_json_ws (p);
+  errno = 0;
+  value = strtol (p, &end, 10);
+  if (end == p || errno) {
+    return 0;
+  }
+  *out = (int) value;
+  return end;
+}
+
+static int admin_parse_reconcile_entry (const char *p, const char **out_end, admin_desired_secret_spec_t *spec) {
+  char key[64];
+  char string_value[256];
+
+  memset (spec, 0, sizeof (*spec));
+  p = skip_json_ws (p);
+  if (*p != '{') {
+    return -1;
+  }
+  p++;
+
+  while (1) {
+    p = skip_json_ws (p);
+    if (*p == '}') {
+      p++;
+      break;
+    }
+
+    p = json_parse_string_token (p, key, sizeof (key));
+    if (!p) {
+      return -1;
+    }
+    p = skip_json_ws (p);
+    if (*p != ':') {
+      return -1;
+    }
+    p++;
+
+    if (!strcmp (key, "secret")) {
+      p = json_parse_string_token (p, string_value, sizeof (string_value));
+      if (!p || bytes_from_hex (string_value, (int) strlen (string_value), spec->secret, SECRET_STORE_SECRET_LEN) < 0) {
+        return -1;
+      }
+      spec->has_secret = 1;
+      secret_store_compute_id (spec->secret, spec->secret_id);
+    } else if (!strcmp (key, "secret_id")) {
+      p = json_parse_string_token (p, string_value, sizeof (string_value));
+      if (!p || strlen (string_value) >= sizeof (spec->secret_id)) {
+        return -1;
+      }
+      snprintf (spec->secret_id, sizeof (spec->secret_id), "%s", string_value);
+    } else if (!strcmp (key, "label")) {
+      p = json_parse_string_token (p, spec->label, sizeof (spec->label));
+      if (!p) {
+        return -1;
+      }
+    } else if (!strcmp (key, "max_active_connections")) {
+      p = json_parse_int_token (p, &spec->limits.max_active_connections);
+      if (!p) {
+        return -1;
+      }
+    } else if (!strcmp (key, "max_new_conn_per_min")) {
+      p = json_parse_int_token (p, &spec->limits.max_new_conn_per_min);
+      if (!p) {
+        return -1;
+      }
+    } else {
+      return -1;
+    }
+
+    p = skip_json_ws (p);
+    if (*p == ',') {
+      p++;
+      continue;
+    }
+    if (*p == '}') {
+      p++;
+      break;
+    }
+    return -1;
+  }
+
+  if (!spec->secret_id[0]) {
+    return -1;
+  }
+  if (spec->has_secret) {
+    char computed_id[SECRET_STORE_SECRET_ID_LEN];
+    secret_store_compute_id (spec->secret, computed_id);
+    if (strcmp (computed_id, spec->secret_id)) {
+      return -1;
+    }
+  }
+
+  *out_end = p;
+  return 0;
+}
+
+static void admin_free_reconcile_plan (admin_reconcile_plan_t *plan) {
+  free (plan->to_add);
+  free (plan->to_update);
+  free (plan->unchanged);
+  free (plan->to_remove);
+  memset (plan, 0, sizeof (*plan));
+}
+
+static int admin_append_snapshot (SecretEntrySnapshot **items, int *count, int *capacity, const SecretEntrySnapshot *snapshot) {
+  if (*count >= *capacity) {
+    int new_capacity = *capacity ? (*capacity << 1) : 16;
+    SecretEntrySnapshot *new_items = realloc (*items, (size_t) new_capacity * sizeof (**items));
+    if (!new_items) {
+      return -1;
+    }
+    *items = new_items;
+    *capacity = new_capacity;
+  }
+  (*items)[*count] = *snapshot;
+  (*count)++;
+  return 0;
+}
+
+static int admin_append_spec (admin_desired_secret_spec_t **items, int *count, int *capacity, const admin_desired_secret_spec_t *spec) {
+  if (*count >= *capacity) {
+    int new_capacity = *capacity ? (*capacity << 1) : 16;
+    admin_desired_secret_spec_t *new_items = realloc (*items, (size_t) new_capacity * sizeof (**items));
+    if (!new_items) {
+      return -1;
+    }
+    *items = new_items;
+    *capacity = new_capacity;
+  }
+  (*items)[*count] = *spec;
+  (*count)++;
+  return 0;
+}
+
+static int admin_parse_reconcile_request (const char *json, admin_desired_secret_spec_t **out_specs, int *out_count, int *out_dry_run) {
+  const char *array = json_find_key (json, "secrets");
+  int capacity = 0;
+  int count = 0;
+  admin_desired_secret_spec_t *specs = 0;
+
+  *out_specs = 0;
+  *out_count = 0;
+  *out_dry_run = 0;
+
+  if (json_extract_bool_field (json, "dry_run", out_dry_run) < 0) {
+    *out_dry_run = 0;
+  }
+
+  if (!array) {
+    return -1;
+  }
+  array = skip_json_ws (array);
+  if (*array != '[') {
+    return -1;
+  }
+  array++;
+
+  while (1) {
+    admin_desired_secret_spec_t spec;
+    int i;
+
+    array = skip_json_ws (array);
+    if (*array == ']') {
+      array++;
+      break;
+    }
+
+    const char *next = 0;
+    if (admin_parse_reconcile_entry (array, &next, &spec) < 0) {
+      free (specs);
+      return -1;
+    }
+
+    for (i = 0; i < count; i++) {
+      if (!strcmp (specs[i].secret_id, spec.secret_id)) {
+        free (specs);
+        return -1;
+      }
+    }
+
+    if (admin_append_spec (&specs, &count, &capacity, &spec) < 0) {
+      free (specs);
+      return -1;
+    }
+
+    array = skip_json_ws (next);
+    if (*array == ',') {
+      array++;
+      continue;
+    }
+    if (*array == ']') {
+      array++;
+      break;
+    }
+    free (specs);
+    return -1;
+  }
+
+  *out_specs = specs;
+  *out_count = count;
+  return 0;
+}
+
+static int admin_build_reconcile_plan (const admin_desired_secret_spec_t *desired_specs, int desired_count, admin_reconcile_plan_t *plan) {
+  int current_count = secret_store_count ();
+  int i;
+  int add_capacity = 0, update_capacity = 0, unchanged_capacity = 0, remove_capacity = 0;
+
+  memset (plan, 0, sizeof (*plan));
+
+  for (i = 0; i < desired_count; i++) {
+    SecretEntrySnapshot current_snapshot;
+    int has_current = secret_store_copy_snapshot_by_id (desired_specs[i].secret_id, &current_snapshot) == 0;
+
+    if (!has_current) {
+      if (!desired_specs[i].has_secret) {
+        admin_free_reconcile_plan (plan);
+        return -1;
+      }
+      if (admin_append_spec (&plan->to_add, &plan->to_add_count, &add_capacity, &desired_specs[i]) < 0) {
+        admin_free_reconcile_plan (plan);
+        return -1;
+      }
+      continue;
+    }
+
+    if (strcmp (current_snapshot.label, desired_specs[i].label) ||
+        current_snapshot.limits.max_active_connections != desired_specs[i].limits.max_active_connections ||
+        current_snapshot.limits.max_new_conn_per_min != desired_specs[i].limits.max_new_conn_per_min) {
+      if (admin_append_spec (&plan->to_update, &plan->to_update_count, &update_capacity, &desired_specs[i]) < 0) {
+        admin_free_reconcile_plan (plan);
+        return -1;
+      }
+    } else {
+      if (admin_append_snapshot (&plan->unchanged, &plan->unchanged_count, &unchanged_capacity, &current_snapshot) < 0) {
+        admin_free_reconcile_plan (plan);
+        return -1;
+      }
+    }
+  }
+
+  for (i = 0; i < current_count; i++) {
+    SecretEntrySnapshot snapshot;
+    int desired_index;
+    if (secret_store_copy_snapshot_at (i, &snapshot) < 0) {
+      continue;
+    }
+    for (desired_index = 0; desired_index < desired_count; desired_index++) {
+      if (!strcmp (desired_specs[desired_index].secret_id, snapshot.secret_id)) {
+        break;
+      }
+    }
+    if (desired_index == desired_count) {
+      if (admin_append_snapshot (&plan->to_remove, &plan->to_remove_count, &remove_capacity, &snapshot) < 0) {
+        admin_free_reconcile_plan (plan);
+        return -1;
+      }
+    }
+  }
+
+  return 0;
+}
+
+static int admin_apply_reconcile_plan (const admin_reconcile_plan_t *plan) {
+  int i;
+
+  for (i = 0; i < plan->to_remove_count; i++) {
+    if (secret_store_remove (plan->to_remove[i].secret_id) < 0) {
+      return -1;
+    }
+  }
+
+  for (i = 0; i < plan->to_update_count; i++) {
+    if (secret_store_update (plan->to_update[i].secret_id, &plan->to_update[i].limits, plan->to_update[i].label) < 0) {
+      return -1;
+    }
+  }
+
+  for (i = 0; i < plan->to_add_count; i++) {
+    if (!plan->to_add[i].has_secret ||
+        secret_store_add (plan->to_add[i].secret, plan->to_add[i].limits, plan->to_add[i].label, 0) < 0) {
+      return -1;
+    }
+  }
+
+  return 0;
+}
+
+static int admin_write_reconcile_json (char *body, size_t body_size, int dry_run, const admin_reconcile_plan_t *plan) {
+  char *ptr = body;
+  size_t remaining = body_size;
+  int i;
+
+  if (append_bufferf (&ptr, &remaining,
+      "{\"ok\":true,\"dry_run\":%s,\"summary\":{\"to_add\":%d,\"to_update\":%d,\"to_remove\":%d,\"unchanged\":%d},"
+      "\"to_add\":[",
+      dry_run ? "true" : "false",
+      plan->to_add_count,
+      plan->to_update_count,
+      plan->to_remove_count,
+      plan->unchanged_count) < 0) {
+    return -1;
+  }
+
+  for (i = 0; i < plan->to_add_count; i++) {
+    if (append_bufferf (&ptr, &remaining, "%s{\"secret_id\":\"%s\"}", i ? "," : "", plan->to_add[i].secret_id) < 0) {
+      return -1;
+    }
+  }
+
+  if (append_bufferf (&ptr, &remaining, "],\"to_update\":[") < 0) {
+    return -1;
+  }
+  for (i = 0; i < plan->to_update_count; i++) {
+    if (append_bufferf (&ptr, &remaining, "%s{\"secret_id\":\"%s\"}", i ? "," : "", plan->to_update[i].secret_id) < 0) {
+      return -1;
+    }
+  }
+
+  if (append_bufferf (&ptr, &remaining, "],\"to_remove\":[") < 0) {
+    return -1;
+  }
+  for (i = 0; i < plan->to_remove_count; i++) {
+    if (append_bufferf (&ptr, &remaining, "%s{\"secret_id\":\"%s\"}", i ? "," : "", plan->to_remove[i].secret_id) < 0) {
+      return -1;
+    }
+  }
+
+  if (append_bufferf (&ptr, &remaining, "],\"unchanged\":[") < 0) {
+    return -1;
+  }
+  for (i = 0; i < plan->unchanged_count; i++) {
+    if (append_bufferf (&ptr, &remaining, "%s{\"secret_id\":\"%s\"}", i ? "," : "", plan->unchanged[i].secret_id) < 0) {
+      return -1;
+    }
+  }
+
+  if (append_bufferf (&ptr, &remaining, "]}") < 0) {
+    return -1;
+  }
+  return 0;
+}
+
+static int write_admin_json_response (connection_job_t c, int code, const char *body) {
+  int body_len = body ? (int) strlen (body) : 0;
+  struct raw_message *raw = calloc (sizeof (*raw), 1);
+  rwm_init (raw, 0);
+  write_basic_http_header_raw (c, raw, code, 0, body_len, "Cache-Control: no-store\r\n", "application/json");
+  if (body_len > 0) {
+    assert (rwm_push_data (raw, body, body_len) == body_len);
+  }
+  mpq_push_w (CONN_INFO(c)->out_queue, raw, 0);
+  job_signal (JOB_REF_CREATE_PASS (c), JS_RUN);
+  return 0;
+}
+
+static int admin_check_auth (const char *headers, int headers_len, int *error_code) {
+  char auth_header[512];
+  if (!admin_enabled || !admin_token || !*admin_token) {
+    *error_code = 404;
+    return -1;
+  }
+  if (get_http_header (headers, headers_len, auth_header, sizeof (auth_header), "Authorization", 13) < 0) {
+    *error_code = 401;
+    return -1;
+  }
+  const char *prefix = "Bearer ";
+  if (strncmp (auth_header, prefix, strlen (prefix)) || strcmp (auth_header + strlen (prefix), admin_token)) {
+    *error_code = 403;
+    return -1;
+  }
+  return 0;
+}
+
+static int admin_write_secrets_json (char *body, size_t body_size, int include_secret_once, const char *generated_secret_hex, const char *created_secret_id) {
+  char *ptr = body;
+  size_t remaining = body_size;
+  int i;
+  int count = secret_store_count ();
+
+  if (append_bufferf (&ptr, &remaining, "{\"ok\":true,\"count\":%d,\"secrets\":[", count) < 0) {
+    return -1;
+  }
+
+  for (i = 0; i < count; i++) {
+    SecretEntrySnapshot snapshot;
+    if (secret_store_copy_snapshot_at (i, &snapshot) < 0) {
+      break;
+    }
+    if (append_bufferf (&ptr, &remaining,
+        "%s{\"secret_id\":\"%s\",\"label\":",
+        i ? "," : "",
+        snapshot.secret_id) < 0 ||
+        append_json_string (&ptr, &remaining, snapshot.label) < 0 ||
+        append_bufferf (&ptr, &remaining,
+        ",\"max_active_connections\":%d,\"max_new_conn_per_min\":%d,"
+        "\"active_conns\":%d,\"total_accepted\":%llu,\"total_rejected_limit\":%llu,"
+        "\"total_rejected_rate_limit\":%llu,\"created_at\":%lld,\"last_seen\":%lld}",
+        snapshot.limits.max_active_connections,
+        snapshot.limits.max_new_conn_per_min,
+        snapshot.active_conns,
+        snapshot.total_accepted,
+        snapshot.total_rejected_limit,
+        snapshot.total_rejected_rate_limit,
+        snapshot.created_at,
+        snapshot.last_seen) < 0) {
+      return -1;
+    }
+  }
+
+  if (append_bufferf (&ptr, &remaining, "]") < 0) {
+    return -1;
+  }
+  if (include_secret_once && generated_secret_hex && created_secret_id) {
+    if (append_bufferf (&ptr, &remaining, ",\"created\":{\"secret_id\":\"%s\",\"secret\":\"%s\"}", created_secret_id, generated_secret_hex) < 0) {
+      return -1;
+    }
+  }
+  if (append_bufferf (&ptr, &remaining, "}") < 0) {
+    return -1;
+  }
+  return 0;
+}
 
 int ext_rpcs_execute (connection_job_t C, int op, struct raw_message *msg);
 
@@ -1420,6 +2110,274 @@ int hts_stats_execute (connection_job_t c, struct raw_message *msg, int op) {
   sb_release (&sb);
   
   return 0;
+}
+
+int hts_admin_execute (connection_job_t c, struct raw_message *msg, int op) {
+  struct hts_data *D = HTS_DATA(c);
+  char *request = 0;
+  char *body = 0;
+  char *uri = 0;
+  char method_override[32];
+  int error_code = 0;
+
+  if (check_conn_buffers (c) < 0) {
+    return -429;
+  }
+
+  if (CONN_INFO(c)->remote_ip != 0x7f000001) {
+    return -404;
+  }
+
+  if (!(op == htqt_get || op == htqt_post || op == htqt_options)) {
+    D->query_flags &= ~QF_KEEPALIVE;
+    return -501;
+  }
+
+  if (D->data_size < 0) {
+    D->data_size = 0;
+  }
+
+  if (D->data_size > 65536 || D->header_size > MAX_HTTP_HEADER_SIZE) {
+    D->query_flags &= ~QF_KEEPALIVE;
+    return -413;
+  }
+
+  if (msg->total_bytes < D->header_size + D->data_size) {
+    return D->header_size + D->data_size - msg->total_bytes;
+  }
+
+  request = calloc ((size_t) D->header_size + D->data_size + 1, 1);
+  if (!request) {
+    return -500;
+  }
+  assert (rwm_fetch_data (msg, request, D->header_size + D->data_size) == D->header_size + D->data_size);
+
+  if (admin_check_auth (request, D->header_size, &error_code) < 0) {
+    free (request);
+    return -error_code;
+  }
+
+  uri = request + D->uri_offset;
+  body = request + D->header_size;
+  request[D->uri_offset + D->uri_size] = 0;
+  request[D->header_size + D->data_size] = 0;
+  method_override[0] = 0;
+  get_http_header (request, D->header_size, method_override, sizeof (method_override), "X-HTTP-Method-Override", 22);
+
+  if (op == htqt_options) {
+    static const char options_body[] = "{\"ok\":true}";
+    write_admin_json_response (c, 200, options_body);
+    free (request);
+    return 0;
+  }
+
+  if (!strcmp (uri, "/admin/health") && op == htqt_get) {
+    char response[1024];
+    snprintf (response, sizeof (response),
+      "{\"ok\":true,\"admin_enabled\":true,\"state_file\":\"%s\",\"secret_count\":%d}",
+      secret_store_get_state_file (),
+      secret_store_count ());
+    write_admin_json_response (c, 200, response);
+    free (request);
+    return 0;
+  }
+
+  if ((!strcmp (uri, "/admin/secrets") || !strcmp (uri, "/admin/stats/secrets")) && op == htqt_get) {
+    char response[1 << 20];
+    if (admin_write_secrets_json (response, sizeof (response), 0, 0, 0) < 0) {
+      free (request);
+      return -500;
+    }
+    write_admin_json_response (c, 200, response);
+    free (request);
+    return 0;
+  }
+
+  if (!strcmp (uri, "/admin/reconcile") && op == htqt_post) {
+    admin_desired_secret_spec_t *desired_specs = 0;
+    admin_reconcile_plan_t plan;
+    int desired_count = 0;
+    int dry_run = 0;
+    char response[1 << 18];
+
+    if (admin_parse_reconcile_request (body, &desired_specs, &desired_count, &dry_run) < 0 ||
+        admin_build_reconcile_plan (desired_specs, desired_count, &plan) < 0) {
+      free (desired_specs);
+      free (request);
+      return -400;
+    }
+
+    if (!dry_run && admin_apply_reconcile_plan (&plan) < 0) {
+      admin_free_reconcile_plan (&plan);
+      free (desired_specs);
+      free (request);
+      return -500;
+    }
+
+    if (admin_write_reconcile_json (response, sizeof (response), dry_run, &plan) < 0) {
+      admin_free_reconcile_plan (&plan);
+      free (desired_specs);
+      free (request);
+      return -500;
+    }
+
+    admin_free_reconcile_plan (&plan);
+    free (desired_specs);
+    write_admin_json_response (c, 200, response);
+    free (request);
+    return 0;
+  }
+
+  if (!strcmp (uri, "/admin/secrets") && op == htqt_post) {
+    char secret_hex[SECRET_STORE_SECRET_LEN * 2 + 1];
+    char label[SECRET_STORE_LABEL_LEN];
+    unsigned char secret[SECRET_STORE_SECRET_LEN];
+    char created_secret_id[SECRET_STORE_SECRET_ID_LEN];
+    int generated_secret = 0;
+    int max_active_connections = 0;
+    int max_new_conn_per_min = 0;
+    int has_max_active_connections = json_extract_int_field (body, "max_active_connections", &max_active_connections) == 0;
+    int has_max_new_conn_per_min = json_extract_int_field (body, "max_new_conn_per_min", &max_new_conn_per_min) == 0;
+    int has_secret = json_extract_string_field (body, "secret", secret_hex, sizeof (secret_hex)) == 0;
+
+    memset (label, 0, sizeof (label));
+    int has_label = json_extract_string_field (body, "label", label, sizeof (label)) == 0;
+
+    if (has_secret) {
+      if (bytes_from_hex (secret_hex, strlen (secret_hex), secret, sizeof (secret)) < 0) {
+        free (request);
+        return -400;
+      }
+    } else {
+      assert (RAND_bytes (secret, sizeof (secret)) == 1);
+      bytes_to_hex_local (secret, sizeof (secret), secret_hex, sizeof (secret_hex));
+      generated_secret = 1;
+    }
+
+    secret_limits_t limits = {
+      .max_active_connections = has_max_active_connections ? max_active_connections : 0,
+      .max_new_conn_per_min = has_max_new_conn_per_min ? max_new_conn_per_min : 0
+    };
+
+    int add_result = secret_store_add (secret, limits, has_label ? label : 0, created_secret_id);
+    if (add_result < 0) {
+      free (request);
+      return -500;
+    }
+
+    char response[1 << 20];
+    if (admin_write_secrets_json (response, sizeof (response), generated_secret, generated_secret ? secret_hex : 0, created_secret_id) < 0) {
+      free (request);
+      return -500;
+    }
+    write_admin_json_response (c, add_result == 1 ? 200 : 201, response);
+    free (request);
+    return 0;
+  }
+
+  if (!strncmp (uri, "/admin/secrets/", 15)) {
+    const char *secret_id = uri + 15;
+    if (strlen (secret_id) >= SECRET_STORE_SECRET_ID_LEN) {
+      free (request);
+      return -414;
+    }
+
+    if (op == htqt_get) {
+      char response[1 << 14];
+      SecretEntrySnapshot snapshot;
+      int i;
+      int found = 0;
+      for (i = 0; i < secret_store_count (); i++) {
+        if (secret_store_copy_snapshot_at (i, &snapshot) == 0 && !strcmp (snapshot.secret_id, secret_id)) {
+          found = 1;
+          break;
+        }
+      }
+      if (!found) {
+        free (request);
+        return -404;
+      }
+      snprintf (response, sizeof (response),
+        "{\"ok\":true,\"secret\":{\"secret_id\":\"%s\",\"label\":\"%s\",\"max_active_connections\":%d,\"max_new_conn_per_min\":%d,\"active_conns\":%d,\"total_accepted\":%llu,\"total_rejected_limit\":%llu,\"total_rejected_rate_limit\":%llu,\"created_at\":%lld,\"last_seen\":%lld}}",
+        snapshot.secret_id,
+        snapshot.label,
+        snapshot.limits.max_active_connections,
+        snapshot.limits.max_new_conn_per_min,
+        snapshot.active_conns,
+        snapshot.total_accepted,
+        snapshot.total_rejected_limit,
+        snapshot.total_rejected_rate_limit,
+        snapshot.created_at,
+        snapshot.last_seen);
+      write_admin_json_response (c, 200, response);
+      free (request);
+      return 0;
+    }
+
+    if (op == htqt_post && !strcmp (method_override, "DELETE")) {
+      int remove_result = secret_store_remove (secret_id);
+      if (remove_result < 0) {
+        free (request);
+        return -404;
+      }
+      write_admin_json_response (c, 200, "{\"ok\":true}");
+      free (request);
+      return 0;
+    }
+
+    if (op == htqt_post && !strcmp (method_override, "PATCH")) {
+      char label[SECRET_STORE_LABEL_LEN];
+      int max_active_connections = 0;
+      int max_new_conn_per_min = 0;
+      secret_limits_t limits = {0};
+      int has_label;
+      int has_max_active_connections;
+      int has_max_new_conn_per_min;
+
+      memset (label, 0, sizeof (label));
+      has_label = json_extract_string_field (body, "label", label, sizeof (label)) == 0;
+      has_max_active_connections = json_extract_int_field (body, "max_active_connections", &max_active_connections) == 0;
+      has_max_new_conn_per_min = json_extract_int_field (body, "max_new_conn_per_min", &max_new_conn_per_min) == 0;
+
+      if (!has_label && !has_max_active_connections && !has_max_new_conn_per_min) {
+        free (request);
+        return -400;
+      }
+
+      SecretEntrySnapshot snapshot;
+      int found = 0;
+      int i;
+      for (i = 0; i < secret_store_count (); i++) {
+        if (secret_store_copy_snapshot_at (i, &snapshot) == 0 && !strcmp (snapshot.secret_id, secret_id)) {
+          found = 1;
+          break;
+        }
+      }
+      if (!found) {
+        free (request);
+        return -404;
+      }
+
+      limits = snapshot.limits;
+      if (has_max_active_connections) {
+        limits.max_active_connections = max_active_connections;
+      }
+      if (has_max_new_conn_per_min) {
+        limits.max_new_conn_per_min = max_new_conn_per_min;
+      }
+
+      if (secret_store_update (secret_id, &limits, has_label ? label : 0) < 0) {
+        free (request);
+        return -500;
+      }
+      write_admin_json_response (c, 200, "{\"ok\":true}");
+      free (request);
+      return 0;
+    }
+  }
+
+  free (request);
+  return -404;
 }
 
 // NET-CPU context
@@ -2075,6 +3033,12 @@ void cron (void) {
 int sfd;
 int http_ports_num;
 int http_sfd[MAX_HTTP_LISTEN_PORTS], http_port[MAX_HTTP_LISTEN_PORTS];
+int admin_sfd = -1;
+int admin_port = 0;
+int admin_default_port = 7081;
+int admin_enabled;
+char *admin_token;
+char *admin_state_file;
 static int domain_count;
 static int secret_count;
 
@@ -2103,6 +3067,9 @@ void mtfront_pre_loop (void) {
         }
       }
     }
+    if (admin_enabled && admin_sfd >= 0) {
+      init_listening_connection_ext (admin_sfd, &ct_http_server_mtfront, &http_methods_admin, SM_LOWPRIO, -10);
+    }
     // create_all_outbound_connections ();
   }
 }
@@ -2130,6 +3097,35 @@ void usage (void) {
   printf ("\tSimple MT-Proto proxy\n");
   parse_usage ();
   exit (2);
+}
+
+static void mtproxy_admin_load_config (void) {
+  const char *token_env = getenv ("MTPROXY_ADMIN_TOKEN");
+  const char *port_env = getenv ("MTPROXY_ADMIN_PORT");
+  const char *state_file_env = getenv ("MTPROXY_ADMIN_STATE_FILE");
+
+  if (!admin_token && token_env && *token_env) {
+    admin_token = strdup (token_env);
+  }
+  if (!admin_port && port_env && *port_env) {
+    admin_port = atoi (port_env);
+  }
+  if (!admin_state_file && state_file_env && *state_file_env) {
+    admin_state_file = strdup (state_file_env);
+  }
+
+  if (admin_token && *admin_token) {
+    if (!admin_port) {
+      admin_port = admin_default_port;
+    }
+    if (!admin_state_file) {
+      admin_state_file = strdup ("state/admin-secrets.json");
+    }
+    admin_enabled = 1;
+    secret_store_set_state_file (admin_state_file);
+  } else {
+    admin_enabled = 0;
+  }
 }
 
 server_functions_t mtproto_front_functions;
@@ -2188,6 +3184,18 @@ int f_parse_option (int val) {
     engine_set_http_fallback (&ct_http_server, &http_methods_stats);
     mtproto_front_functions.flags &= ~ENGINE_NO_PORT;
     break;
+  case 2001:
+    admin_port = atoi (optarg);
+    if (admin_port <= 0 || admin_port >= 65536) {
+      usage ();
+    }
+    break;
+  case 2002:
+    if (admin_state_file) {
+      free (admin_state_file);
+    }
+    admin_state_file = strdup (optarg);
+    break;
   case 'D':
     tcp_rpc_add_proxy_domain (optarg);
     domain_count++;
@@ -2220,7 +3228,10 @@ int f_parse_option (int val) {
         }
       }
       if (val == 'S') {
-	tcp_rpcs_set_ext_secret (secret);
+	if (tcp_rpcs_set_ext_secret (secret) < 0) {
+	  kprintf ("failed to register mtproto secret: secret store limit exceeded\n");
+	  usage ();
+	}
 	secret_count++;
       } else {
 	memcpy (proxy_tag, secret, sizeof (proxy_tag));
@@ -2236,6 +3247,8 @@ int f_parse_option (int val) {
 
 void mtfront_prepare_parse_options (void) {
   parse_option ("http-stats", no_argument, 0, 2000, "allow http server to answer on stats queries");
+  parse_option ("admin-port", required_argument, 0, 2001, "bind admin API on 127.0.0.1:<port> (requires MTPROXY_ADMIN_TOKEN)");
+  parse_option ("admin-state-file", required_argument, 0, 2002, "path to persistent admin secret store state file");
   parse_option ("mtproto-secret", required_argument, 0, 'S', "16-byte secret in hex mode");
   parse_option ("proxy-tag", required_argument, 0, 'P', "16-byte proxy tag in hex mode to be passed along with all forwarded queries");
   parse_option ("domain", required_argument, 0, 'D', "adds allowed domain for TLS-transport mode, disables other transports; can be specified more than once");
@@ -2259,6 +3272,7 @@ void mtfront_parse_extra_args (int argc, char *argv[]) /* {{{ */ {
 // executed BEFORE dropping privileges
 void mtfront_pre_init (void) {
   init_ct_server_mtfront ();
+  mtproxy_admin_load_config ();
 
   int res = do_reload_config (0x26);
 
@@ -2287,6 +3301,21 @@ void mtfront_pre_init (void) {
     http_sfd[i] = server_socket (http_port[i], engine_state->settings_addr, engine_get_backlog (), enable_ipv6);
     if (http_sfd[i] < 0) {
       kprintf ("cannot open http/tcp server socket at port %d: %m\n", http_port[i]);
+      exit (1);
+    }
+  }
+
+  if (admin_enabled) {
+    if (secret_store_load () < 0) {
+      kprintf ("failed to load admin secret state from %s\n", secret_store_get_state_file ());
+      exit (1);
+    }
+
+    struct in_addr admin_addr;
+    admin_addr.s_addr = htonl (0x7f000001);
+    admin_sfd = server_socket (admin_port, admin_addr, engine_get_backlog (), 0);
+    if (admin_sfd < 0) {
+      kprintf ("cannot open admin http server socket at 127.0.0.1:%d: %m\n", admin_port);
       exit (1);
     }
   }
